@@ -75,6 +75,8 @@ TIMELAPSE_FPS_CAP = int(os.getenv("TIMELAPSE_FPS_CAP", "30"))
 # Watchdog: force reconnect if no jpeg_image within this window
 IMAGE_TIMEOUT_SECONDS = int(os.getenv("IMAGE_TIMEOUT_SECONDS", "60"))
 WATCHDOG_TICK_SECONDS = int(os.getenv("WATCHDOG_TICK_SECONDS", "5"))
+# Status watchdog: mark status UNKNOWN if no printer_status within this window
+STATUS_TIMEOUT_SECONDS = int(os.getenv("STATUS_TIMEOUT_SECONDS", "30"))
 
 FINISHED_STATES = {
     "FINISH",
@@ -923,6 +925,38 @@ async def image_watchdog(
 
 
 # -----------------------------------------------------------------------------
+# WebSocket watchdog (no printer_status -> mark UNKNOWN)
+# -----------------------------------------------------------------------------
+async def status_watchdog(
+    pstate: PrinterState, ws: aiohttp.ClientWebSocketResponse, connected_at: datetime
+) -> None:
+    while state.run_event.is_set() and not ws.closed:
+        await asyncio.sleep(max(1, WATCHDOG_TICK_SECONDS))
+        async with pstate.lock:
+            last_status_ts = pstate.latest_status_ts
+            current_status = pstate.latest_status
+        base_ts = last_status_ts or connected_at
+        if (now_utc() - base_ts).total_seconds() > STATUS_TIMEOUT_SECONDS:
+            current_state = (safe_get(current_status, "gcode_state") or "").upper()
+            if current_state != "UNKNOWN":
+                logger.warning(
+                    "[%s] No printer_status in %ds; marking status UNKNOWN.",
+                    pstate.printer_id,
+                    STATUS_TIMEOUT_SECONDS,
+                )
+                unknown_status: Dict[str, Any] = {"gcode_state": "UNKNOWN"}
+                async with pstate.lock:
+                    pstate.latest_status = unknown_status
+                    pstate.latest_status_ts = now_utc()
+                try:
+                    await maybe_notify_on_update(pstate, unknown_status)
+                except Exception as e:
+                    logger.exception(
+                        "[%s] Notify error (UNKNOWN): %s", pstate.printer_id, e
+                    )
+
+
+# -----------------------------------------------------------------------------
 # Periodic forced reconnect guard
 # -----------------------------------------------------------------------------
 async def periodic_reconnect_guard(
@@ -965,6 +999,9 @@ async def websocket_loop_for_printer(pstate: PrinterState) -> None:
                 connected_at = now_utc()
                 watchdog_task = asyncio.create_task(
                     image_watchdog(pstate, ws, connected_at)
+                )
+                status_task = asyncio.create_task(
+                    status_watchdog(pstate, ws, connected_at)
                 )
                 periodic_task = asyncio.create_task(
                     periodic_reconnect_guard(pstate, ws)
@@ -1059,6 +1096,11 @@ async def websocket_loop_for_printer(pstate: PrinterState) -> None:
                     watchdog_task.cancel()
                     try:
                         await watchdog_task
+                    except asyncio.CancelledError:
+                        pass
+                    status_task.cancel()
+                    try:
+                        await status_task
                     except asyncio.CancelledError:
                         pass
                     periodic_task.cancel()
