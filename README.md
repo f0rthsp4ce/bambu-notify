@@ -20,10 +20,11 @@ A tiny FastAPI + aiohttp service that:
 ## Endpoints (all prefixed with `/api`)
 
 - `GET /api/` → health check (`OK`)
-- `GET /api/printer/{PRINTER_ID}` → latest JSON status
-- `GET /api/printer/{PRINTER_ID}/image` → latest JPEG frame (binary)
+- `GET /api/printers` → list known printers `{ printer_id, model, is_online, has_status }`
+- `GET /api/printer/{printer_id}` → latest JSON status for that printer
+- `GET /api/printer/{printer_id}/image` → latest JPEG frame (binary) for that printer
 
-> By default `PRINTER_ID=A1M-1`, so the concrete paths are:
+> Back-compat: if you still rely on a fixed `PRINTER_ID`, the same paths work:
 > - `GET /api/printer/A1M-1`
 > - `GET /api/printer/A1M-1/image`
 
@@ -38,8 +39,11 @@ curl -s -o frame.jpg http://localhost:8000/api/printer/A1M-1/image
 
 | Name                     | Default                                              | Description                                                  |
 | ------------------------ | ---------------------------------------------------- | ------------------------------------------------------------ |
-| `PRINTER_ID`             | `A1M-1`                                              | Printer ID used in the WebSocket URL and the fixed API path. |
-| `WS_URL`                 | `wss://print.lo.f0rth.space/ws/printer/{PRINTER_ID}` | Override WebSocket URL if needed.                            |
+| `PRINTER_ID`             | `A1M-1`                                              | Seed printer ID for backward compatibility.                  |
+| `WS_URL`                 | `wss://print.lo.f0rth.space/ws/printer/{PRINTER_ID}` | Legacy single-printer URL, used only for startup logs.       |
+| `PRINTERS_API_URL`       | `https://print.lo.f0rth.space/api/printers`          | Discovery endpoint returning printers list.                  |
+| `PRINTERS_REFRESH_SECONDS` | `3600`                                            | How often to refresh printers list (hourly by default).      |
+| `WS_URL_TEMPLATE`        | `wss://print.lo.f0rth.space/ws/printer/{printer_id}` | Template for per-printer WebSocket URL.                      |
 | `PORT`                   | `8000`                                               | HTTP port for FastAPI.                                       |
 | `TELEGRAM_BOT_TOKEN`     | —                                                    | **Required** to enable Telegram notifications.               |
 | `TELEGRAM_CHAT_ID`       | —                                                    | **Required** chat ID (negative for supergroups).             |
@@ -82,6 +86,10 @@ pip install openai==1.99.9
 export TELEGRAM_BOT_TOKEN=123456:ABCDEF...
 export TELEGRAM_CHAT_ID=-1001234567890
 # export TELEGRAM_THREAD_ID=42           # optional
+# Dynamic printers (optional overrides)
+# export PRINTERS_API_URL=https://print.lo.f0rth.space/api/printers
+# export PRINTERS_REFRESH_SECONDS=3600
+# export WS_URL_TEMPLATE=wss://print.lo.f0rth.space/ws/printer/{printer_id}
 export OPENROUTER_API_KEY=sk-or-...
 # export OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
 # export AI_MODEL=google/gemini-2.5-flash
@@ -107,17 +115,18 @@ docker run --rm -p 8000:8000 \
 
 ## Behavior Details
 
-* **Resilient WebSocket:** Exponential backoff (bounded), automatic reconnect on network issues.
+* **Resilient WebSocket:** Exponential backoff (bounded), automatic reconnect per-printer on network issues.
 * **Image Watchdog:** If no `jpeg_image` is received for `IMAGE_TIMEOUT_SECONDS` (default 60s), the socket is closed intentionally to force a reconnect.
-* **Hourly Photos:** While a print is active, the service posts a snapshot at `PHOTO_INTERVAL_SECONDS`. The timer resets on new jobs.
+* **Hourly Photos:** While a print is active, the service posts a snapshot at `PHOTO_INTERVAL_SECONDS` per printer. The timer resets on new jobs.
 * **Final Photo:** When the job reaches a finished state (e.g., `FINISH`, `IDLE`, `DONE`), a last snapshot is posted (if available).
-* **Timelapse:** On completion, frames saved under `images/<job_name>/` are compiled with ffmpeg into an MP4 and saved alongside the frames. The video is kept under `TIMELAPSE_MAX_BYTES` via adaptive width/CRF/bitrate and is sent to Telegram.
+* **Timelapse:** On completion, frames saved under `images/<printer_id>/<job_name>/` are compiled with ffmpeg into an MP4 and saved alongside the frames. The video is kept under `TIMELAPSE_MAX_BYTES` via adaptive width/CRF/bitrate and is sent to Telegram.
 * **Progress Pacing:** Notifications at `PROGRESS_STEP`% increments; also on state transitions and errors.
-* **AI Defect Detection (optional):** On an hourly cadence per job, the latest frame is analyzed by the configured OpenRouter model; if a defect is detected above threshold, a text alert and evidence photo are posted.
+* **AI Defect Detection (optional):** On an hourly cadence per job (per printer), the latest frame is analyzed by the configured OpenRouter model; if a defect is detected above threshold, a text alert and evidence photo are posted.
 
 ## Notes & Tips
 
-* The API stores only the **latest** status and frame in memory; it does not persist history.
+* The API stores only the **latest** status and frame in memory per printer; it does not persist history.
+* Printers are discovered from `PRINTERS_API_URL` and refreshed every `PRINTERS_REFRESH_SECONDS`. Only printers with `is_online=true` spawn WebSocket connections.
 * Ensure your bot has permission to post photos in the destination chat/thread.
 * Use a reverse proxy (nginx/traefik) for TLS/ingress in production.
 * Health check: `GET /api/` returns `OK`. You can add readiness checks to also verify `latest_status_ts` recency if desired.
