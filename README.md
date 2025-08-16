@@ -14,6 +14,7 @@ A tiny FastAPI + aiohttp service that:
   - **final photo on completion**
   - **timelapse video on completion (≤ 50 MB, saved to disk and sent to Telegram)**
 - Automatically **reconnects** on WebSocket errors **and** if **no `jpeg_image`** arrives for 60s.
+ - Automatically **reconnects** on WebSocket errors, if **no `jpeg_image`** arrives for 60s, and also **forces a reconnect every 5 minutes** (configurable).
 - Optional **AI-based defect detection** via OpenRouter (Gemini 2.5 Flash)
  - Saves frames to disk for active print jobs; retains last 7 days by default
 
@@ -52,6 +53,7 @@ curl -s -o frame.jpg http://localhost:8000/api/printer/A1M-1/image
 | `RECONNECT_MIN_SECONDS`  | `1`                                                  | Min backoff on reconnect.                                    |
 | `RECONNECT_MAX_SECONDS`  | `30`                                                 | Max backoff on reconnect.                                    |
 | `PHOTO_INTERVAL_SECONDS` | `3600`                                               | Hourly photo cadence during active prints.                   |
+| `FORCED_RECONNECT_SECONDS` | `300`                                              | Force a reconnect periodically (set ≤ 0 to disable).         |
 | `IMAGE_TIMEOUT_SECONDS`  | `60`                                                 | Force reconnect if no `jpeg_image` in N seconds.             |
 | `WATCHDOG_TICK_SECONDS`  | `5`                                                  | How often the watchdog checks for stale images.              |
 | `IMAGES_DIR`             | `images`                                             | Base directory to save camera frames for active jobs.        |

@@ -48,6 +48,7 @@ PROGRESS_STEP = int(os.getenv("PROGRESS_STEP", "5"))
 RECONNECT_MIN_SECONDS = float(os.getenv("RECONNECT_MIN_SECONDS", "1"))
 RECONNECT_MAX_SECONDS = float(os.getenv("RECONNECT_MAX_SECONDS", "30"))
 PHOTO_INTERVAL_SECONDS = int(os.getenv("PHOTO_INTERVAL_SECONDS", "3600"))
+FORCED_RECONNECT_SECONDS = int(os.getenv("FORCED_RECONNECT_SECONDS", "300"))
 
 # AI / OpenRouter configuration
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
@@ -922,6 +923,32 @@ async def image_watchdog(
 
 
 # -----------------------------------------------------------------------------
+# Periodic forced reconnect guard
+# -----------------------------------------------------------------------------
+async def periodic_reconnect_guard(
+    pstate: PrinterState, ws: aiohttp.ClientWebSocketResponse
+) -> None:
+    if FORCED_RECONNECT_SECONDS <= 0:
+        return
+    try:
+        await asyncio.sleep(max(1, FORCED_RECONNECT_SECONDS))
+        if not ws.closed:
+            logger.info(
+                "[%s] Forcing periodic reconnect after %ds.",
+                pstate.printer_id,
+                FORCED_RECONNECT_SECONDS,
+            )
+            try:
+                await ws.close(
+                    code=aiohttp.WSCloseCode.OK, message=b"periodic-reconnect"
+                )
+            except Exception:
+                pass
+    except asyncio.CancelledError:
+        pass
+
+
+# -----------------------------------------------------------------------------
 # WebSocket loop with auto-reconnect
 # -----------------------------------------------------------------------------
 async def websocket_loop_for_printer(pstate: PrinterState) -> None:
@@ -938,6 +965,9 @@ async def websocket_loop_for_printer(pstate: PrinterState) -> None:
                 connected_at = now_utc()
                 watchdog_task = asyncio.create_task(
                     image_watchdog(pstate, ws, connected_at)
+                )
+                periodic_task = asyncio.create_task(
+                    periodic_reconnect_guard(pstate, ws)
                 )
 
                 try:
@@ -1029,6 +1059,11 @@ async def websocket_loop_for_printer(pstate: PrinterState) -> None:
                     watchdog_task.cancel()
                     try:
                         await watchdog_task
+                    except asyncio.CancelledError:
+                        pass
+                    periodic_task.cancel()
+                    try:
+                        await periodic_task
                     except asyncio.CancelledError:
                         pass
 
