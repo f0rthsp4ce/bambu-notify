@@ -7,6 +7,12 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any
 
 import aiohttp
+
+try:
+    # Prefer async client to avoid blocking the event loop
+    from openai import AsyncOpenAI  # type: ignore
+except Exception:  # pragma: no cover
+    AsyncOpenAI = None  # type: ignore
 from fastapi import FastAPI, APIRouter, Response, HTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse
 import uvicorn
@@ -28,6 +34,13 @@ PROGRESS_STEP = int(os.getenv("PROGRESS_STEP", "5"))
 RECONNECT_MIN_SECONDS = float(os.getenv("RECONNECT_MIN_SECONDS", "1"))
 RECONNECT_MAX_SECONDS = float(os.getenv("RECONNECT_MAX_SECONDS", "30"))
 PHOTO_INTERVAL_SECONDS = int(os.getenv("PHOTO_INTERVAL_SECONDS", "3600"))
+
+# AI / OpenRouter configuration
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+AI_MODEL = os.getenv("AI_MODEL", "google/gemini-2.5-flash")
+AI_CHECK_INTERVAL_SECONDS = int(os.getenv("AI_CHECK_INTERVAL_SECONDS", "3600"))
+AI_CONFIDENCE_THRESHOLD = float(os.getenv("AI_CONFIDENCE_THRESHOLD", "0.7"))
 
 # Watchdog: force reconnect if no jpeg_image within this window
 IMAGE_TIMEOUT_SECONDS = int(os.getenv("IMAGE_TIMEOUT_SECONDS", "60"))
@@ -77,6 +90,11 @@ class AppState:
         # Hourly photo sending
         self.last_photo_sent_at: Optional[datetime] = None
         self.last_photo_job: Optional[str] = None
+
+        # AI checks
+        self.last_ai_check_at: Optional[datetime] = None
+        self.last_ai_job: Optional[str] = None
+        self.ai_client: Optional[Any] = None
 
         # Lifecycle
         self.run_event = asyncio.Event()
@@ -227,6 +245,148 @@ def summarize_status_for_notification(status: Dict[str, Any]) -> str:
     if gcode_state:
         bits.append(f"State: {gcode_state}")
     return " | ".join(bits) if bits else "Update received."
+
+
+# -----------------------------------------------------------------------------
+# AI (OpenRouter via openai library)
+# -----------------------------------------------------------------------------
+def ai_is_enabled() -> bool:
+    return bool(OPENROUTER_API_KEY and AsyncOpenAI is not None)
+
+
+async def ensure_ai_client():
+    if not ai_is_enabled():
+        return None
+    if state.ai_client is None:
+        try:
+            state.ai_client = AsyncOpenAI(
+                base_url=OPENROUTER_BASE_URL,
+                api_key=OPENROUTER_API_KEY,
+            )
+        except Exception as e:
+            logger.exception("Failed to initialize AI client: %s", e)
+            state.ai_client = None
+    return state.ai_client
+
+
+def _image_to_data_uri(image_bytes: bytes) -> str:
+    b64 = base64.b64encode(image_bytes).decode("ascii")
+    return f"data:image/jpeg;base64,{b64}"
+
+
+async def analyze_image_with_ai(image_bytes: bytes) -> Optional[Dict[str, Any]]:
+    """Analyze image for visible failures/defects using the configured model.
+
+    Returns: {"has_defect": bool, "confidence": float [0..1], "summary": str} or None.
+    """
+    client = await ensure_ai_client()
+    if client is None:
+        return None
+    try:
+        system_prompt = (
+            "You are an expert 3D printing monitor. Analyze the photo for visible print failures "
+            "or defects (e.g., spaghetti, layer shifts, adhesion issues, severe stringing, nozzle crash). "
+            'Respond ONLY with strict JSON: {"has_defect": boolean, "confidence": number between 0 and 1, "summary": short string}.'
+        )
+        user_text = "Check for any visible failure or defect in this print frame. If likely failing, set has_defect=true."
+        data_uri = _image_to_data_uri(image_bytes)
+        resp = await client.chat.completions.create(
+            model=AI_MODEL,
+            temperature=0.1,
+            max_tokens=300,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": user_text},
+                        {"type": "image_url", "image_url": {"url": data_uri}},
+                    ],
+                },
+            ],
+        )
+        content = (resp.choices[0].message.content or "").strip()
+        try:
+            parsed = json.loads(content)
+        except Exception:
+            lowered = content.lower()
+            has_defect = any(
+                kw in lowered
+                for kw in [
+                    "defect",
+                    "failure",
+                    "spaghetti",
+                    "layer shift",
+                    "crash",
+                    "detached",
+                    "warping",
+                    "stringing",
+                ]
+            )
+            parsed = {
+                "has_defect": has_defect,
+                "confidence": 0.5,
+                "summary": content[:300],
+            }
+        verdict = bool(parsed.get("has_defect", False))
+        try:
+            conf = float(parsed.get("confidence", 0))
+        except Exception:
+            conf = 0.0
+        summary = str(parsed.get("summary") or "")
+        return {"has_defect": verdict, "confidence": conf, "summary": summary}
+    except Exception as e:
+        logger.exception("AI analysis failed: %s", e)
+        return None
+
+
+async def ai_check_and_alert_if_needed() -> None:
+    """Run defect analysis on the latest frame on a per-job hourly cadence."""
+    async with state.lock:
+        status = state.latest_status
+        img = state.latest_image_bytes
+        job = safe_get(status, "subtask_name")
+        last_checked = state.last_ai_check_at
+        last_job = state.last_ai_job
+
+    if not ai_is_enabled() or not status or not img:
+        return
+    if not is_print_active(status):
+        return
+
+    if job != last_job:
+        async with state.lock:
+            state.last_ai_job = job
+            state.last_ai_check_at = None
+        last_checked = None
+
+    due = (last_checked is None) or (
+        (now_utc() - last_checked) >= timedelta(seconds=AI_CHECK_INTERVAL_SECONDS)
+    )
+    if not due:
+        return
+
+    result = await analyze_image_with_ai(img)
+    async with state.lock:
+        state.last_ai_check_at = now_utc()
+
+    if not result:
+        return
+
+    has_defect = bool(result.get("has_defect", False))
+    confidence = float(result.get("confidence", 0.0))
+    summary = str(result.get("summary") or "")
+
+    if has_defect and confidence >= AI_CONFIDENCE_THRESHOLD:
+        caption = (
+            f"🚨 Possible print failure detected @cofob\n"
+            f"Confidence: {confidence:.2f}\n"
+            f"{summarize_status_for_notification(status)}\n"
+            f"Finding: {summary[:400]}\n"
+            f"Time: {now_utc().isoformat()}"
+        )
+        await telegram_send(caption)
+        await telegram_send_photo(img, "🔎 Evidence frame")
 
 
 async def send_hourly_photo_if_needed() -> None:
@@ -470,6 +630,9 @@ async def photo_loop() -> None:
         try:
             if telegram_is_enabled():
                 await send_hourly_photo_if_needed()
+            # Run AI check on a similar lightweight cadence
+            if ai_is_enabled():
+                await ai_check_and_alert_if_needed()
         except Exception as e:
             logger.exception("Hourly photo loop error: %s", e)
         await asyncio.sleep(tick_seconds)
@@ -555,6 +718,17 @@ async def on_startup():
     global _ws_task, _photo_task
     _ws_task = asyncio.create_task(websocket_loop())
     _photo_task = asyncio.create_task(photo_loop())
+    if ai_is_enabled():
+        # Warm up AI client early to pay the init cost upfront
+        try:
+            await ensure_ai_client()
+            logger.info(
+                "AI client initialized. Model=%s BaseURL=%s",
+                AI_MODEL,
+                OPENROUTER_BASE_URL,
+            )
+        except Exception:
+            logger.warning("AI client initialization skipped or failed.")
 
 
 @app.on_event("shutdown")
@@ -573,6 +747,7 @@ async def on_shutdown():
     _photo_task = None
     if state.http_session and not state.http_session.closed:
         await state.http_session.close()
+    # No explicit close needed for AsyncOpenAI
 
 
 # -----------------------------------------------------------------------------

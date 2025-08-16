@@ -8,11 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-COPY <<EOF /app/requirements.txt
-fastapi==0.115.0
-uvicorn[standard]==0.30.6
-aiohttp==3.10.5
-EOF
+COPY requirements.txt /app/requirements.txt
 
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
@@ -27,6 +23,10 @@ ENV RECONNECT_MAX_SECONDS=30
 ENV PHOTO_INTERVAL_SECONDS=3600
 ENV IMAGE_TIMEOUT_SECONDS=60
 ENV WATCHDOG_TICK_SECONDS=5
+ENV OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
+ENV AI_MODEL=google/gemini-2.5-flash
+ENV AI_CHECK_INTERVAL_SECONDS=3600
+ENV AI_CONFIDENCE_THRESHOLD=0.7
 
 EXPOSE 8000
 CMD ["python", "app.py"]

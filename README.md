@@ -13,6 +13,7 @@ A tiny FastAPI + aiohttp service that:
   - **hourly photo snapshots while printing**
   - **final photo on completion**
 - Automatically **reconnects** on WebSocket errors **and** if **no `jpeg_image`** arrives for 60s.
+- Optional **AI-based defect detection** via OpenRouter (Gemini 2.5 Flash)
 
 ## Endpoints (all prefixed with `/api`)
 
@@ -47,6 +48,11 @@ curl -s -o frame.jpg http://localhost:8000/api/printer/A1M-1/image
 | `PHOTO_INTERVAL_SECONDS` | `3600`                                               | Hourly photo cadence during active prints.                   |
 | `IMAGE_TIMEOUT_SECONDS`  | `60`                                                 | Force reconnect if no `jpeg_image` in N seconds.             |
 | `WATCHDOG_TICK_SECONDS`  | `5`                                                  | How often the watchdog checks for stale images.              |
+| `OPENROUTER_API_KEY`     | —                                                    | API key for OpenRouter. Enables AI checks when set.          |
+| `OPENROUTER_BASE_URL`    | `https://openrouter.ai/api/v1`                      | Base URL for OpenRouter.                                     |
+| `AI_MODEL`               | `google/gemini-2.5-flash`                           | Vision-capable model ID on OpenRouter.                       |
+| `AI_CHECK_INTERVAL_SECONDS` | `3600`                                           | How often to run AI frame checks per job.                    |
+| `AI_CONFIDENCE_THRESHOLD`| `0.7`                                                | Min confidence to alert on detected defect.                  |
 
 ## Telegram Setup
 
@@ -62,10 +68,16 @@ curl -s -o frame.jpg http://localhost:8000/api/printer/A1M-1/image
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install fastapi==0.115.0 "uvicorn[standard]==0.30.6" aiohttp==3.10.5
+pip install openai==1.99.9
 
 export TELEGRAM_BOT_TOKEN=123456:ABCDEF...
 export TELEGRAM_CHAT_ID=-1001234567890
 # export TELEGRAM_THREAD_ID=42           # optional
+export OPENROUTER_API_KEY=sk-or-...
+# export OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
+# export AI_MODEL=google/gemini-2.5-flash
+# export AI_CHECK_INTERVAL_SECONDS=3600
+# export AI_CONFIDENCE_THRESHOLD=0.6
 
 python app.py
 # API at: http://localhost:8000/api/...
@@ -79,6 +91,7 @@ docker run --rm -p 8000:8000 \
   -e TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN \
   -e TELEGRAM_CHAT_ID=$TELEGRAM_CHAT_ID \
   -e TELEGRAM_THREAD_ID=$TELEGRAM_THREAD_ID \
+  -e OPENROUTER_API_KEY=$OPENROUTER_API_KEY \
   -e PRINTER_ID=A1M-1 \
   printer-bridge:latest
 ```
@@ -90,6 +103,7 @@ docker run --rm -p 8000:8000 \
 * **Hourly Photos:** While a print is active, the service posts a snapshot at `PHOTO_INTERVAL_SECONDS`. The timer resets on new jobs.
 * **Final Photo:** When the job reaches a finished state (e.g., `FINISH`, `IDLE`, `DONE`), a last snapshot is posted (if available).
 * **Progress Pacing:** Notifications at `PROGRESS_STEP`% increments; also on state transitions and errors.
+* **AI Defect Detection (optional):** On an hourly cadence per job, the latest frame is analyzed by the configured OpenRouter model; if a defect is detected above threshold, a text alert and evidence photo are posted.
 
 ## Notes & Tips
 
