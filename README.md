@@ -14,6 +14,7 @@ A tiny FastAPI + aiohttp service that:
   - **final photo on completion**
 - Automatically **reconnects** on WebSocket errors **and** if **no `jpeg_image`** arrives for 60s.
 - Optional **AI-based defect detection** via OpenRouter (Gemini 2.5 Flash)
+ - Saves frames to disk for active print jobs; retains last 7 days by default
 
 ## Endpoints (all prefixed with `/api`)
 
@@ -48,6 +49,9 @@ curl -s -o frame.jpg http://localhost:8000/api/printer/A1M-1/image
 | `PHOTO_INTERVAL_SECONDS` | `3600`                                               | Hourly photo cadence during active prints.                   |
 | `IMAGE_TIMEOUT_SECONDS`  | `60`                                                 | Force reconnect if no `jpeg_image` in N seconds.             |
 | `WATCHDOG_TICK_SECONDS`  | `5`                                                  | How often the watchdog checks for stale images.              |
+| `IMAGES_DIR`             | `images`                                             | Base directory to save camera frames for active jobs.        |
+| `IMAGE_RETENTION_DAYS`   | `7`                                                  | How many days to retain saved images.                        |
+| `RETENTION_CLEANUP_INTERVAL_SECONDS` | `3600`                                  | Cleanup cadence check (piggybacks hourly loop).              |
 | `OPENROUTER_API_KEY`     | —                                                    | API key for OpenRouter. Enables AI checks when set.          |
 | `OPENROUTER_BASE_URL`    | `https://openrouter.ai/api/v1`                      | Base URL for OpenRouter.                                     |
 | `AI_MODEL`               | `google/gemini-2.5-flash`                           | Vision-capable model ID on OpenRouter.                       |

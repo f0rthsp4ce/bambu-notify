@@ -5,6 +5,7 @@ import json
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any
+from pathlib import Path
 
 import aiohttp
 
@@ -41,6 +42,13 @@ OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/ap
 AI_MODEL = os.getenv("AI_MODEL", "google/gemini-2.5-flash")
 AI_CHECK_INTERVAL_SECONDS = int(os.getenv("AI_CHECK_INTERVAL_SECONDS", "3600"))
 AI_CONFIDENCE_THRESHOLD = float(os.getenv("AI_CONFIDENCE_THRESHOLD", "0.7"))
+
+# Image archival configuration
+IMAGES_DIR = os.getenv("IMAGES_DIR", "images")
+IMAGE_RETENTION_DAYS = int(os.getenv("IMAGE_RETENTION_DAYS", "7"))
+RETENTION_CLEANUP_INTERVAL_SECONDS = int(
+    os.getenv("RETENTION_CLEANUP_INTERVAL_SECONDS", "3600")
+)
 
 # Watchdog: force reconnect if no jpeg_image within this window
 IMAGE_TIMEOUT_SECONDS = int(os.getenv("IMAGE_TIMEOUT_SECONDS", "60"))
@@ -103,6 +111,10 @@ class AppState:
         # Shared HTTP session
         self.http_session: Optional[aiohttp.ClientSession] = None
 
+        # Filesystem
+        self.images_base_path: Path = Path(IMAGES_DIR)
+        self.last_retention_cleanup_at: Optional[datetime] = None
+
 
 state = AppState()
 
@@ -155,6 +167,50 @@ def is_print_active(status: Optional[Dict[str, Any]]) -> bool:
     except Exception:
         pass
     return False
+
+
+def ensure_images_dir(subdir: Optional[str] = None) -> Path:
+    base = state.images_base_path
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        logger.warning("Failed to create base images dir %s: %s", base, e)
+    if subdir:
+        path = base / subdir
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            logger.warning("Failed to create subdir %s: %s", path, e)
+        return path
+    return base
+
+
+def build_image_filename(job_name: Optional[str], ts: datetime, seq: int) -> str:
+    safe_job = (job_name or "unknown").replace("/", "_").replace("\\", "_")
+    return f"{ts.strftime('%Y%m%dT%H%M%S')}_{seq:06d}_{safe_job}.jpg"
+
+
+async def save_image_if_active_job(image_bytes: bytes) -> None:
+    if not image_bytes:
+        return
+    async with state.lock:
+        status = state.latest_status
+        ts = state.latest_image_ts or now_utc()
+        seq = state.image_seq
+    if not is_print_active(status):
+        return
+    job = safe_get(status, "subtask_name")
+    target_dir = ensure_images_dir(job or None)
+    fname = build_image_filename(job, ts, seq)
+    try:
+        # Write atomically
+        tmp_path = target_dir / (fname + ".tmp")
+        final_path = target_dir / fname
+        with open(tmp_path, "wb") as f:
+            f.write(image_bytes)
+        os.replace(tmp_path, final_path)
+    except Exception as e:
+        logger.warning("Failed to save image %s: %s", fname, e)
 
 
 # -----------------------------------------------------------------------------
@@ -389,6 +445,44 @@ async def ai_check_and_alert_if_needed() -> None:
         await telegram_send_photo(img, "🔎 Evidence frame")
 
 
+# -----------------------------------------------------------------------------
+# Image retention cleanup
+# -----------------------------------------------------------------------------
+async def delete_old_images() -> None:
+    """Delete images older than IMAGE_RETENTION_DAYS from IMAGES_DIR."""
+    try:
+        base = ensure_images_dir()
+        cutoff = now_utc() - timedelta(days=IMAGE_RETENTION_DAYS)
+        # Iterate through all subdirectories (job names) and files
+        for sub in base.iterdir():
+            try:
+                if sub.is_file():
+                    # Unexpected files directly under base
+                    mtime = datetime.fromtimestamp(sub.stat().st_mtime, tz=timezone.utc)
+                    if mtime < cutoff:
+                        sub.unlink(missing_ok=True)
+                    continue
+                if not sub.is_dir():
+                    continue
+                for file in sub.iterdir():
+                    if not file.is_file():
+                        continue
+                    mtime = datetime.fromtimestamp(
+                        file.stat().st_mtime, tz=timezone.utc
+                    )
+                    if mtime < cutoff:
+                        file.unlink(missing_ok=True)
+                # Remove empty job folders
+                try:
+                    next(sub.iterdir())
+                except StopIteration:
+                    sub.rmdir()
+            except Exception as e:
+                logger.debug("Retention scan skip %s: %s", sub, e)
+    except Exception as e:
+        logger.debug("Retention cleanup error: %s", e)
+
+
 async def send_hourly_photo_if_needed() -> None:
     """Send a photo if active job hasn't had one in PHOTO_INTERVAL_SECONDS."""
     async with state.lock:
@@ -492,6 +586,13 @@ async def websocket_loop() -> None:
                                             state.latest_image_bytes = decoded
                                             state.latest_image_ts = now_utc()
                                             state.image_seq += 1
+                                        # Persist only if a print job is active
+                                        try:
+                                            await save_image_if_active_job(decoded)
+                                        except Exception as e:
+                                            logger.debug(
+                                                "Image save skipped/failed: %s", e
+                                            )
                                     except Exception:
                                         logger.warning(
                                             "Failed to decode JPEG image (base64)."
@@ -633,6 +734,17 @@ async def photo_loop() -> None:
             # Run AI check on a similar lightweight cadence
             if ai_is_enabled():
                 await ai_check_and_alert_if_needed()
+            # Periodic retention cleanup (no more often than configured)
+            now = now_utc()
+            last_cleanup = state.last_retention_cleanup_at
+            if (
+                last_cleanup is None
+                or (now - last_cleanup).total_seconds()
+                >= RETENTION_CLEANUP_INTERVAL_SECONDS
+            ):
+                await delete_old_images()
+                async with state.lock:
+                    state.last_retention_cleanup_at = now
         except Exception as e:
             logger.exception("Hourly photo loop error: %s", e)
         await asyncio.sleep(tick_seconds)
