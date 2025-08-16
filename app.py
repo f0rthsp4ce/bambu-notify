@@ -3,9 +3,12 @@ import asyncio
 import base64
 import json
 import logging
+import math
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Set, List, Tuple
 from pathlib import Path
+import shutil
+import tempfile
 
 import aiohttp
 
@@ -49,6 +52,14 @@ IMAGE_RETENTION_DAYS = int(os.getenv("IMAGE_RETENTION_DAYS", "7"))
 RETENTION_CLEANUP_INTERVAL_SECONDS = int(
     os.getenv("RETENTION_CLEANUP_INTERVAL_SECONDS", "3600")
 )
+
+# Timelapse configuration
+TIMELAPSE_MAX_BYTES = int(os.getenv("TIMELAPSE_MAX_BYTES", str(50 * 1024 * 1024)))
+TIMELAPSE_TARGET_DURATION_SECONDS = int(
+    os.getenv("TIMELAPSE_TARGET_DURATION_SECONDS", "45")
+)
+TIMELAPSE_MAX_WIDTH = int(os.getenv("TIMELAPSE_MAX_WIDTH", "1280"))
+TIMELAPSE_FPS_CAP = int(os.getenv("TIMELAPSE_FPS_CAP", "30"))
 
 # Watchdog: force reconnect if no jpeg_image within this window
 IMAGE_TIMEOUT_SECONDS = int(os.getenv("IMAGE_TIMEOUT_SECONDS", "60"))
@@ -114,6 +125,11 @@ class AppState:
         # Filesystem
         self.images_base_path: Path = Path(IMAGES_DIR)
         self.last_retention_cleanup_at: Optional[datetime] = None
+
+        # Timelapse guard (avoid duplicate builds per completed job)
+        self.completed_timelapse_jobs: Set[str] = set()
+        self.current_job_name: Optional[str] = None
+        self.current_job_started_at: Optional[datetime] = None
 
 
 state = AppState()
@@ -265,6 +281,34 @@ async def telegram_send_photo(image_bytes: bytes, caption: str = "") -> None:
         logger.exception("Error sending Telegram photo: %s", e)
 
 
+async def telegram_send_video_file(file_path: Path, caption: str = "") -> None:
+    if not telegram_is_enabled() or not file_path.exists():
+        return
+    try:
+        session = await ensure_http_session()
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo"
+        form = aiohttp.FormData()
+        form.add_field("chat_id", TELEGRAM_CHAT_ID)
+        if TELEGRAM_THREAD_ID:
+            form.add_field("message_thread_id", str(int(TELEGRAM_THREAD_ID)))
+        if caption:
+            form.add_field("caption", caption)
+        form.add_field("supports_streaming", "true")
+        with open(file_path, "rb") as f:
+            form.add_field(
+                "video",
+                f,
+                filename=file_path.name,
+                content_type="video/mp4",
+            )
+            async with session.post(url, data=form) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    logger.warning("Telegram video failed: %s %s", resp.status, body)
+    except Exception as e:
+        logger.exception("Error sending Telegram video: %s", e)
+
+
 def format_time_remaining(minutes_val: Optional[int]) -> str:
     if minutes_val is None:
         return "n/a"
@@ -301,6 +345,190 @@ def summarize_status_for_notification(status: Dict[str, Any]) -> str:
     if gcode_state:
         bits.append(f"State: {gcode_state}")
     return " | ".join(bits) if bits else "Update received."
+
+
+# -----------------------------------------------------------------------------
+# Timelapse utilities
+# -----------------------------------------------------------------------------
+def _parse_ts_from_filename(name: str) -> Optional[datetime]:
+    # Expected: YYYYMMDDThhmmss_XXXXXX_job.jpg
+    try:
+        base = name.split("_")[0]
+        return datetime.strptime(base, "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def _collect_job_images(job_name: str, started_at: Optional[datetime]) -> List[Path]:
+    job_dir = ensure_images_dir(job_name or None)
+    if not job_dir.exists() or not job_dir.is_dir():
+        return []
+    files = [p for p in job_dir.iterdir() if p.is_file() and p.suffix.lower() == ".jpg"]
+    if not files:
+        return []
+    # Filter by started_at if available
+    if started_at is not None:
+        filtered: List[Tuple[Path, float]] = []
+        for p in files:
+            ts = _parse_ts_from_filename(p.name)
+            if ts is None:
+                mtime = datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc)
+                if mtime >= started_at:
+                    filtered.append((p, p.stat().st_mtime))
+            else:
+                if ts >= started_at:
+                    filtered.append((p, ts.timestamp()))
+        files_sorted = [fp for fp, _ in sorted(filtered, key=lambda x: x[1])]
+    else:
+        files_sorted = sorted(files, key=lambda p: p.name)
+    return files_sorted
+
+
+async def _run_ffmpeg_build(
+    frames_dir: Path,
+    frame_fps: int,
+    max_width: int,
+    crf: int,
+    out_path: Path,
+    target_bitrate_kbps: Optional[int] = None,
+) -> bool:
+    vf_parts = [f"scale='if(gt(iw,{max_width}),{max_width},iw)':-2", "format=yuv420p"]
+    vf = ",".join(vf_parts)
+    cmd: List[str] = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-framerate",
+        str(frame_fps),
+        "-i",
+        str(frames_dir / "%06d.jpg"),
+        "-vf",
+        vf,
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        "-crf",
+        str(crf),
+    ]
+    if target_bitrate_kbps is not None:
+        # Apply a capped bitrate to enforce smaller sizes
+        kbps = max(200, target_bitrate_kbps)
+        cmd += ["-b:v", f"{kbps}k", "-maxrate", f"{kbps}k", "-bufsize", f"{kbps * 2}k"]
+    cmd.append(str(out_path))
+
+    try:
+        proc = await asyncio.create_subprocess_exec(*cmd)
+        await proc.communicate()
+        return proc.returncode == 0 and out_path.exists()
+    except Exception as e:
+        logger.exception("ffmpeg execution failed: %s", e)
+        return False
+
+
+async def build_timelapse(
+    job_name: Optional[str], started_at: Optional[datetime]
+) -> Optional[Path]:
+    if not job_name:
+        return None
+    if shutil.which("ffmpeg") is None:
+        logger.warning("ffmpeg not found; skipping timelapse build.")
+        return None
+    images = _collect_job_images(job_name, started_at)
+    if len(images) < 2:
+        logger.info(
+            "Not enough frames for timelapse (%d) for job %s", len(images), job_name
+        )
+        return None
+
+    # Compute fps to target desired duration
+    frames_count = len(images)
+    target_duration = max(5, TIMELAPSE_TARGET_DURATION_SECONDS)
+    fps_float = min(TIMELAPSE_FPS_CAP, max(1.0, frames_count / float(target_duration)))
+    fps = int(math.ceil(fps_float))
+
+    job_dir = ensure_images_dir(job_name)
+    out_name = f"timelapse_{now_utc().strftime('%Y%m%dT%H%M%S')}.mp4"
+    out_path = job_dir / out_name
+
+    # Prepare temp directory with sequential links
+    with tempfile.TemporaryDirectory(prefix="frames_") as tmp:
+        tmp_dir = Path(tmp)
+        for idx, src in enumerate(images, start=1):
+            dst = tmp_dir / f"{idx:06d}.jpg"
+            try:
+                os.symlink(src.resolve(), dst)
+            except Exception:
+                try:
+                    os.link(src.resolve(), dst)
+                except Exception:
+                    shutil.copy2(src, dst)
+
+        attempts: List[Tuple[int, int, Optional[int]]] = [
+            # (max_width, crf, bitrate_kbps)
+            (TIMELAPSE_MAX_WIDTH, 28, None),
+            (min(TIMELAPSE_MAX_WIDTH, 960), 30, None),
+            (min(TIMELAPSE_MAX_WIDTH, 720), 32, None),
+        ]
+        # Final attempt: enforce bitrate to fit within limit
+        # bitrate (kbps) ~= (MAX_BYTES * 8) / duration / 1000 (with 10% safety)
+        est_duration = max(1.0, frames_count / float(fps))
+        target_kbps = int(((TIMELAPSE_MAX_BYTES * 8.0) / est_duration) / 1000.0 * 0.9)
+        attempts.append((min(TIMELAPSE_MAX_WIDTH, 640), 34, max(200, target_kbps)))
+
+        for max_w, crf, kbps in attempts:
+            tmp_out = out_path.with_suffix("")
+            tmp_out = (
+                tmp_out.parent
+                / f".{tmp_out.name}_{max_w}_{crf}{'_br' if kbps else ''}.mp4"
+            )
+            ok = await _run_ffmpeg_build(tmp_dir, fps, max_w, crf, tmp_out, kbps)
+            if not ok:
+                continue
+            try:
+                size = tmp_out.stat().st_size
+            except Exception:
+                size = 0
+            if 0 < size <= TIMELAPSE_MAX_BYTES:
+                # Move into place
+                try:
+                    os.replace(tmp_out, out_path)
+                except Exception:
+                    shutil.copy2(tmp_out, out_path)
+                return out_path
+            else:
+                try:
+                    tmp_out.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+    logger.warning("Failed to produce timelapse under size limit for job %s", job_name)
+    return None
+
+
+async def build_and_send_timelapse_if_available(status: Dict[str, Any]) -> None:
+    job = safe_get(status, "subtask_name")
+    async with state.lock:
+        started_at = state.current_job_started_at
+        key = f"{job}@{started_at.isoformat()}" if job and started_at else None
+        if key and key in state.completed_timelapse_jobs:
+            return
+    try:
+        out_path = await build_timelapse(job, started_at)
+        if out_path and out_path.exists():
+            caption = f"🎞️ Timelapse\n{summarize_status_for_notification(status)}\nTime: {now_utc().isoformat()}"
+            await telegram_send_video_file(out_path, caption)
+            async with state.lock:
+                if key:
+                    state.completed_timelapse_jobs.add(key)
+    except Exception as e:
+        logger.exception("Timelapse build/send failed: %s", e)
 
 
 # -----------------------------------------------------------------------------
@@ -663,6 +891,9 @@ async def maybe_notify_on_update(new_status: Dict[str, Any]) -> None:
         state.last_notified_percent = None
         state.last_photo_job = new_task
         state.last_photo_sent_at = None
+        # Mark new job session
+        state.current_job_name = new_task
+        state.current_job_started_at = now_utc()
 
     # State change
     if new_state and new_state != state.last_notified_state:
@@ -671,7 +902,7 @@ async def maybe_notify_on_update(new_status: Dict[str, Any]) -> None:
         )
         state.last_notified_state = new_state
 
-        # If job just finished/idle, summary + final photo
+        # If job just finished/idle, summary + final photo + timelapse
         if is_finished_state(new_state):
             await telegram_send(
                 f"✅ Print completed.\n{summarize_status_for_notification(new_status)}"
@@ -681,6 +912,11 @@ async def maybe_notify_on_update(new_status: Dict[str, Any]) -> None:
                 caption = f"🏁 Final photo\n{summarize_status_for_notification(new_status)}\nTime: {now_utc().isoformat()}"
                 await telegram_send_photo(img, caption)
             state.last_photo_sent_at = None
+            # Spawn timelapse build in background to avoid blocking
+            try:
+                asyncio.create_task(build_and_send_timelapse_if_available(new_status))
+            except Exception:
+                logger.debug("Failed to schedule timelapse task")
 
     # Error
     try:

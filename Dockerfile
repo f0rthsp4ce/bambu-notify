@@ -3,7 +3,7 @@
 FROM python:3.11-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl \
+    ca-certificates curl ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -30,6 +30,10 @@ ENV AI_CONFIDENCE_THRESHOLD=0.7
 ENV IMAGES_DIR=images
 ENV IMAGE_RETENTION_DAYS=7
 ENV RETENTION_CLEANUP_INTERVAL_SECONDS=3600
+ENV TIMELAPSE_MAX_BYTES=52428800
+ENV TIMELAPSE_TARGET_DURATION_SECONDS=45
+ENV TIMELAPSE_MAX_WIDTH=1280
+ENV TIMELAPSE_FPS_CAP=30
 
 EXPOSE 8000
 CMD ["python", "app.py"]

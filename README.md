@@ -12,6 +12,7 @@ A tiny FastAPI + aiohttp service that:
   - errors
   - **hourly photo snapshots while printing**
   - **final photo on completion**
+  - **timelapse video on completion (≤ 50 MB, saved to disk and sent to Telegram)**
 - Automatically **reconnects** on WebSocket errors **and** if **no `jpeg_image`** arrives for 60s.
 - Optional **AI-based defect detection** via OpenRouter (Gemini 2.5 Flash)
  - Saves frames to disk for active print jobs; retains last 7 days by default
@@ -52,6 +53,10 @@ curl -s -o frame.jpg http://localhost:8000/api/printer/A1M-1/image
 | `IMAGES_DIR`             | `images`                                             | Base directory to save camera frames for active jobs.        |
 | `IMAGE_RETENTION_DAYS`   | `7`                                                  | How many days to retain saved images.                        |
 | `RETENTION_CLEANUP_INTERVAL_SECONDS` | `3600`                                  | Cleanup cadence check (piggybacks hourly loop).              |
+| `TIMELAPSE_MAX_BYTES`      | `52428800` (50 MB)                               | Maximum size for generated timelapse MP4.                    |
+| `TIMELAPSE_TARGET_DURATION_SECONDS` | `45`                                     | Desired timelapse duration; FPS derived from frame count.    |
+| `TIMELAPSE_MAX_WIDTH`      | `1280`                                           | Max output width; height auto-calculated.                    |
+| `TIMELAPSE_FPS_CAP`        | `30`                                             | Max FPS cap when deriving from frame count.                  |
 | `OPENROUTER_API_KEY`     | —                                                    | API key for OpenRouter. Enables AI checks when set.          |
 | `OPENROUTER_BASE_URL`    | `https://openrouter.ai/api/v1`                      | Base URL for OpenRouter.                                     |
 | `AI_MODEL`               | `google/gemini-2.5-flash`                           | Vision-capable model ID on OpenRouter.                       |
@@ -106,6 +111,7 @@ docker run --rm -p 8000:8000 \
 * **Image Watchdog:** If no `jpeg_image` is received for `IMAGE_TIMEOUT_SECONDS` (default 60s), the socket is closed intentionally to force a reconnect.
 * **Hourly Photos:** While a print is active, the service posts a snapshot at `PHOTO_INTERVAL_SECONDS`. The timer resets on new jobs.
 * **Final Photo:** When the job reaches a finished state (e.g., `FINISH`, `IDLE`, `DONE`), a last snapshot is posted (if available).
+* **Timelapse:** On completion, frames saved under `images/<job_name>/` are compiled with ffmpeg into an MP4 and saved alongside the frames. The video is kept under `TIMELAPSE_MAX_BYTES` via adaptive width/CRF/bitrate and is sent to Telegram.
 * **Progress Pacing:** Notifications at `PROGRESS_STEP`% increments; also on state transitions and errors.
 * **AI Defect Detection (optional):** On an hourly cadence per job, the latest frame is analyzed by the configured OpenRouter model; if a defect is detected above threshold, a text alert and evidence photo are posted.
 
