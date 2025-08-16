@@ -125,6 +125,53 @@ docker run --rm -p 8000:8000 \
 * **Progress Pacing:** Notifications at `PROGRESS_STEP`% increments; also on state transitions and errors.
 * **AI Defect Detection (optional):** On an hourly cadence per job (per printer), the latest frame is analyzed by the configured OpenRouter model; if a defect is detected above threshold, a text alert and evidence photo are posted.
 
+## Manual timelapse from saved snapshots
+
+If you want to build a timelapse yourself from the saved JPEG frames on disk (without waiting for the automatic one), you can use ffmpeg directly.
+
+- **Where frames are saved**: `IMAGES_DIR` (default `images`), organized as `images/<printer_id>/<job_name>/`.
+- **Filename pattern**: `YYYYMMDDThhmmss_XXXXXX_<job>.jpg` (lexicographically sorted by time).
+
+### Quick start (macOS)
+
+```bash
+# 1) Install ffmpeg (once)
+brew install ffmpeg
+
+# 2) Go to the job's frames directory
+cd "images/<printer_id>/<job_name>"
+
+# 3) Build a 30 FPS timelapse (scaled to max width 1280)
+ffmpeg -hide_banner -loglevel error \
+  -pattern_type glob -framerate 30 -i '*.jpg' \
+  -vf "scale='min(iw,1280)':'-2',format=yuv420p,setsar=1" \
+  -c:v libx264 -crf 23 -pix_fmt yuv420p -movflags +faststart \
+  timelapse.mp4
+```
+
+### Target a specific duration
+
+Pick a desired duration (in seconds). FPS will be derived as ceil(frames / duration).
+
+```bash
+cd "images/<printer_id>/<job_name>"
+FRAMES=$(ls -1 *.jpg 2>/dev/null | wc -l | tr -d ' ')
+DURATION=45  # seconds (adjust)
+FPS=$(( (FRAMES + DURATION - 1) / DURATION ))
+[ "$FPS" -lt 1 ] && FPS=1
+
+ffmpeg -hide_banner -loglevel error \
+  -pattern_type glob -framerate "$FPS" -i '*.jpg' \
+  -vf "scale='min(iw,1280)':'-2',format=yuv420p,setsar=1" \
+  -c:v libx264 -crf 23 -pix_fmt yuv420p -movflags +faststart \
+  timelapse.mp4
+```
+
+Notes:
+- The lexicographic order of filenames matches capture time, so globbing `'*.jpg'` produces the correct sequence.
+- If your frames are huge, increase CRF (e.g., 28) to shrink the file, or reduce the max width (e.g., `min(iw,640)`).
+- The service auto-cleans frames older than `IMAGE_RETENTION_DAYS` (default 7 days).
+
 ## Notes & Tips
 
 * The API stores only the **latest** status and frame in memory per printer; it does not persist history.
