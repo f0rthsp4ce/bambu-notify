@@ -570,6 +570,8 @@ async def analyze_image_with_ai(image_bytes: bytes) -> Optional[Dict[str, Any]]:
         system_prompt = (
             "You are an expert 3D printing monitor. Analyze the photo for visible print failures "
             "or defects (e.g., spaghetti, layer shifts, adhesion issues, severe stringing, nozzle crash). "
+            "If the image is blurred or out-of-focus due to the camera, do NOT treat that as a print failure or defect. "
+            "Only flag defects that are clearly visible on the printed part itself. "
             'Respond ONLY with strict JSON: {"has_defect": boolean, "confidence": number between 0 and 1, "summary": short string}.'
         )
         user_text = "Check for any visible failure or defect in this print frame. If likely failing, set has_defect=true."
