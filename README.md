@@ -14,7 +14,7 @@ A tiny FastAPI + aiohttp service that:
   - **final photo on completion**
   - **timelapse video on completion (≤ 50 MB, saved to disk and sent to Telegram)**
 - Automatically **reconnects** on WebSocket errors, if **no `jpeg_image`** arrives for 60s, and also **forces a reconnect every 5 minutes** (configurable).
-- If **no `printer_status`** is received for 30s, marks the printer state as **UNKNOWN** (configurable via `STATUS_TIMEOUT_SECONDS`).
+- If **no `printer_status`** is received for 30s, marks the printer state as **IDLE** (configurable via `STATUS_TIMEOUT_SECONDS`). This can cause a RUNNING → IDLE transition, which triggers completion notifications and timelapse logic.
 - Optional **AI-based defect detection** via OpenRouter (Gemini 2.5 Flash)
 - Saves frames to disk for active print jobs; retains last 7 days by default
 

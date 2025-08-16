@@ -925,7 +925,7 @@ async def image_watchdog(
 
 
 # -----------------------------------------------------------------------------
-# WebSocket watchdog (no printer_status -> mark UNKNOWN)
+# WebSocket watchdog (no printer_status -> mark IDLE)
 # -----------------------------------------------------------------------------
 async def status_watchdog(
     pstate: PrinterState, ws: aiohttp.ClientWebSocketResponse, connected_at: datetime
@@ -938,21 +938,29 @@ async def status_watchdog(
         base_ts = last_status_ts or connected_at
         if (now_utc() - base_ts).total_seconds() > STATUS_TIMEOUT_SECONDS:
             current_state = (safe_get(current_status, "gcode_state") or "").upper()
-            if current_state != "UNKNOWN":
+            if current_state != "IDLE":
                 logger.warning(
-                    "[%s] No printer_status in %ds; marking status UNKNOWN.",
+                    "[%s] No printer_status in %ds; marking status IDLE.",
                     pstate.printer_id,
                     STATUS_TIMEOUT_SECONDS,
                 )
-                unknown_status: Dict[str, Any] = {"gcode_state": "UNKNOWN"}
+                # Preserve last known job name if any, so completion/timelapse can fire
+                last_job = (
+                    safe_get(current_status, "subtask_name")
+                    or pstate.current_job_name
+                    or safe_get(pstate.prev_status, "subtask_name")
+                )
+                idle_status: Dict[str, Any] = {"gcode_state": "IDLE"}
+                if last_job:
+                    idle_status["subtask_name"] = last_job
                 async with pstate.lock:
-                    pstate.latest_status = unknown_status
+                    pstate.latest_status = idle_status
                     pstate.latest_status_ts = now_utc()
                 try:
-                    await maybe_notify_on_update(pstate, unknown_status)
+                    await maybe_notify_on_update(pstate, idle_status)
                 except Exception as e:
                     logger.exception(
-                        "[%s] Notify error (UNKNOWN): %s", pstate.printer_id, e
+                        "[%s] Notify error (IDLE): %s", pstate.printer_id, e
                     )
 
 
