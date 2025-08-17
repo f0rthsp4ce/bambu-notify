@@ -416,13 +416,18 @@ async def http_status_seed_loop() -> None:
                             parsed_ts = now_utc()
                         p = state.printers.get(pid)
                         if p is None:
+                            logger.warning(
+                                "HTTP status seed for %s: printer not found in state!",
+                                pid,
+                            )
                             continue
                         async with p.lock:
                             p.latest_status = status
                             p.latest_status_ts = parsed_ts
                         logger.info(
-                            "HTTP status seed for %s: SUCCESS - updated with %d status fields at %s",
+                            "HTTP status seed for %s: SUCCESS - updated printer_obj=%s with %d status fields at %s",
                             pid,
+                            id(p),  # Memory address to match with metrics collection
                             len(status),
                             parsed_ts.isoformat() if parsed_ts else "unknown",
                         )
@@ -1487,43 +1492,62 @@ class PrinterMetricsCollector:
             labels=["printer_id", "type"],
         )
 
-        # Snapshot printers with proper data access
+        # Snapshot printers with proper data access - since this is sync,
+        # we need to avoid the async locks and copy data atomically
+        printers_data = []
         try:
-            # Get a snapshot of all printer data safely
-            printers_data = []
             logger.debug(
                 "Metrics collection: found %d printers in state", len(state.printers)
             )
-            for printer_id, p in state.printers.items():
+            # Get printer references first
+            printer_refs = list(state.printers.items())
+
+            for printer_id, p in printer_refs:
                 try:
-                    # Capture all needed data in one go to avoid race conditions
+                    # Read all attributes in one atomic operation to minimize race conditions
+                    # Since these are just reading object attributes, they should be atomic
+                    is_online = p.is_online
+                    latest_status = p.latest_status
+                    latest_status_ts = p.latest_status_ts
+                    latest_image_bytes = p.latest_image_bytes
+                    latest_image_ts = p.latest_image_ts
+                    image_seq = p.image_seq
+
                     printer_data = {
                         "printer_id": printer_id,
-                        "is_online": p.is_online,
-                        "latest_status": p.latest_status,
-                        "latest_status_ts": p.latest_status_ts,
-                        "latest_image_bytes": p.latest_image_bytes,
-                        "latest_image_ts": p.latest_image_ts,
-                        "image_seq": p.image_seq,
+                        "is_online": is_online,
+                        "latest_status": latest_status,
+                        "latest_status_ts": latest_status_ts,
+                        "latest_image_bytes": latest_image_bytes,
+                        "latest_image_ts": latest_image_ts,
+                        "image_seq": image_seq,
                     }
                     printers_data.append(printer_data)
+
                     logger.info(
-                        "Metrics collection for %s: has_status=%s, is_online=%s, status_ts=%s",
+                        "Metrics collection for %s: printer_obj=%s, has_status=%s (%s), is_online=%s, status_ts=%s",
                         printer_id,
-                        p.latest_status is not None,
-                        p.is_online,
-                        p.latest_status_ts.isoformat()
-                        if p.latest_status_ts
-                        else "None",
+                        id(p),  # Memory address of printer object
+                        latest_status is not None,
+                        type(latest_status).__name__,  # Type of latest_status
+                        is_online,
+                        latest_status_ts.isoformat() if latest_status_ts else "None",
                     )
-                    if p.latest_status:
+                    if latest_status:
                         logger.info(
-                            "Metrics collection for %s: status keys = %s",
+                            "Metrics collection for %s: status keys = %s, status sample: mc_percent=%s",
                             printer_id,
-                            list(p.latest_status.keys())[:10],
-                        )  # First 10 keys
+                            list(latest_status.keys())[:10],
+                            latest_status.get("mc_percent"),
+                        )
+                    else:
+                        logger.warning(
+                            "Metrics collection for %s: status is %s (should be dict with data!)",
+                            printer_id,
+                            latest_status,
+                        )
                 except Exception as e:
-                    logger.debug(
+                    logger.warning(
                         f"Failed to capture data for printer {printer_id}: {e}"
                     )
                     continue
