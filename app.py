@@ -9,6 +9,7 @@ from typing import Optional, Dict, Any, Set, List, Tuple
 from pathlib import Path
 import shutil
 import tempfile
+from contextlib import asynccontextmanager
 
 import aiohttp
 
@@ -20,7 +21,13 @@ except Exception:  # pragma: no cover
 from fastapi import FastAPI, APIRouter, Response, HTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse
 import uvicorn
-from prometheus_client import REGISTRY, generate_latest, CONTENT_TYPE_LATEST  # type: ignore[import-not-found]
+from prometheus_client import (
+    REGISTRY,
+    generate_latest,
+    CONTENT_TYPE_LATEST,
+    Gauge,
+    CollectorRegistry,
+)  # type: ignore[import-not-found]
 from prometheus_client.core import GaugeMetricFamily  # type: ignore[import-not-found]
 
 # -----------------------------------------------------------------------------
@@ -191,7 +198,7 @@ class AppState:
 
 state = AppState()
 
-app = FastAPI(title="Printer Realtime Bridge", version="1.4.0")
+app = FastAPI(title="Printer Realtime Bridge", version="1.5.0")
 router = APIRouter(prefix="/api")
 
 
@@ -344,6 +351,7 @@ async def printers_discovery_loop() -> None:
                         if model and not p.model:
                             p.model = str(model)
                     p.is_online = is_online
+                    BAMBU_PRINTER_UP.labels(printer_id=pid).set(1 if is_online else 0)
 
             # Mark missing printers offline (but keep them for history)
             async with state.lock:
@@ -352,8 +360,9 @@ async def printers_discovery_loop() -> None:
                 if fetched and pid not in seen:
                     async with state.lock:
                         p = state.printers.get(pid)
-                        if p:
+                        if p is not None:
                             p.is_online = False
+                            BAMBU_PRINTER_UP.labels(printer_id=pid).set(0)
 
             # Reconcile WS tasks
             async with state.lock:
@@ -424,6 +433,103 @@ async def http_status_seed_loop() -> None:
                         async with p.lock:
                             p.latest_status = status
                             p.latest_status_ts = parsed_ts
+                            try:
+                                # Update metrics directly here
+                                BAMBU_LAST_STATUS_TIMESTAMP.labels(printer_id=pid).set(
+                                    parsed_ts.timestamp()
+                                )
+                                BAMBU_PRINT_ACTIVE.labels(printer_id=pid).set(
+                                    1 if is_print_active(status) else 0
+                                )
+
+                                percent = _maybe_parse_number(status.get("mc_percent"))
+                                if percent is not None:
+                                    BAMBU_PROGRESS_PERCENT.labels(printer_id=pid).set(
+                                        percent
+                                    )
+
+                                rem_time = _maybe_parse_number(
+                                    status.get("mc_remaining_time")
+                                )
+                                if rem_time is not None:
+                                    BAMBU_REMAINING_MINUTES.labels(printer_id=pid).set(
+                                        rem_time
+                                    )
+
+                                nozzle_temp = _maybe_parse_number(
+                                    status.get("nozzle_temper")
+                                )
+                                if nozzle_temp is not None:
+                                    BAMBU_NOZZLE_TEMP.labels(printer_id=pid).set(
+                                        nozzle_temp
+                                    )
+
+                                nozzle_target = _maybe_parse_number(
+                                    status.get("nozzle_target_temper")
+                                )
+                                if nozzle_target is not None:
+                                    BAMBU_NOZZLE_TARGET_TEMP.labels(printer_id=pid).set(
+                                        nozzle_target
+                                    )
+
+                                bed_temp = _maybe_parse_number(status.get("bed_temper"))
+                                if bed_temp is not None:
+                                    BAMBU_BED_TEMP.labels(printer_id=pid).set(bed_temp)
+
+                                bed_target = _maybe_parse_number(
+                                    status.get("bed_target_temper")
+                                )
+                                if bed_target is not None:
+                                    BAMBU_BED_TARGET_TEMP.labels(printer_id=pid).set(
+                                        bed_target
+                                    )
+
+                                chamber_temp = _maybe_parse_number(
+                                    status.get("chamber_temper")
+                                )
+                                if chamber_temp is not None:
+                                    BAMBU_CHAMBER_TEMP.labels(printer_id=pid).set(
+                                        chamber_temp
+                                    )
+
+                                speed = _maybe_parse_number(status.get("spd_mag"))
+                                if speed is not None:
+                                    BAMBU_PRINT_SPEED.labels(printer_id=pid).set(speed)
+
+                                fan_cool = _maybe_parse_number(
+                                    status.get("cooling_fan_speed")
+                                )
+                                if fan_cool is not None:
+                                    BAMBU_COOLING_FAN_SPEED.labels(printer_id=pid).set(
+                                        fan_cool
+                                    )
+
+                                fan_hb = _maybe_parse_number(
+                                    status.get("heatbreak_fan_speed")
+                                )
+                                if fan_hb is not None:
+                                    BAMBU_HEATBREAK_FAN_SPEED.labels(
+                                        printer_id=pid
+                                    ).set(fan_hb)
+
+                                error_code = _maybe_parse_number(
+                                    status.get("print_error")
+                                )
+                                if error_code is not None:
+                                    BAMBU_PRINT_ERROR.labels(printer_id=pid).set(
+                                        error_code
+                                    )
+
+                                wifi = _maybe_parse_number(status.get("wifi_signal"))
+                                if wifi is not None:
+                                    BAMBU_WIFI_SIGNAL.labels(printer_id=pid).set(wifi)
+
+                            except Exception as e:
+                                logger.warning(
+                                    "[%s] Failed to update metrics from HTTP seed: %s",
+                                    pid,
+                                    e,
+                                )
                         logger.info(
                             "HTTP status seed for %s: SUCCESS - updated printer_obj=%s with %d status fields at %s",
                             pid,
@@ -1174,10 +1280,25 @@ async def websocket_loop_for_printer(pstate: PrinterState) -> None:
                                 if isinstance(b64, str):
                                     try:
                                         decoded = base64.b64decode(b64, validate=False)
+                                        now = now_utc()
                                         async with pstate.lock:
                                             pstate.latest_image_bytes = decoded
-                                            pstate.latest_image_ts = now_utc()
+                                            pstate.latest_image_ts = now
                                             pstate.image_seq += 1
+                                            seq = pstate.image_seq
+                                        try:
+                                            BAMBU_LAST_IMAGE_TIMESTAMP.labels(
+                                                printer_id=pstate.printer_id
+                                            ).set(now.timestamp())
+                                            BAMBU_IMAGE_SEQ.labels(
+                                                printer_id=pstate.printer_id
+                                            ).set(seq)
+                                        except Exception as e:
+                                            logger.warning(
+                                                "[%s] Failed to update image metrics: %s",
+                                                pstate.printer_id,
+                                                e,
+                                            )
                                         # Persist only if a print job is active
                                         try:
                                             await save_image_if_active_job(
@@ -1263,6 +1384,111 @@ async def websocket_loop_for_printer(pstate: PrinterState) -> None:
 # -----------------------------------------------------------------------------
 # Prometheus Exporter
 # -----------------------------------------------------------------------------
+def _unregister_metric_if_exists(
+    metric_name: str, registry: CollectorRegistry = REGISTRY
+):
+    if metric_name in registry._names_to_collectors:
+        registry.unregister(registry._names_to_collectors[metric_name])
+
+
+_unregister_metric_if_exists("bambu_printer_up")
+BAMBU_PRINTER_UP = Gauge(
+    "bambu_printer_up",
+    "Printer online status from discovery (1=online,0=offline)",
+    ["printer_id"],
+)
+_unregister_metric_if_exists("bambu_printer_is_active")
+BAMBU_PRINT_ACTIVE = Gauge(
+    "bambu_printer_is_active",
+    "Whether a print appears active based on status",
+    ["printer_id"],
+)
+_unregister_metric_if_exists("bambu_printer_last_status_timestamp_seconds")
+BAMBU_LAST_STATUS_TIMESTAMP = Gauge(
+    "bambu_printer_last_status_timestamp_seconds",
+    "Unix timestamp of the last received status for this printer",
+    ["printer_id"],
+)
+_unregister_metric_if_exists("bambu_printer_last_image_timestamp_seconds")
+BAMBU_LAST_IMAGE_TIMESTAMP = Gauge(
+    "bambu_printer_last_image_timestamp_seconds",
+    "Unix timestamp of the last received image for this printer",
+    ["printer_id"],
+)
+_unregister_metric_if_exists("bambu_printer_image_seq")
+BAMBU_IMAGE_SEQ = Gauge(
+    "bambu_printer_image_seq",
+    "Monotonic counter of frames observed in the current process",
+    ["printer_id"],
+)
+_unregister_metric_if_exists("bambu_progress_percent")
+BAMBU_PROGRESS_PERCENT = Gauge(
+    "bambu_progress_percent",
+    "Current reported print progress percent (mc_percent)",
+    ["printer_id"],
+)
+_unregister_metric_if_exists("bambu_remaining_time_minutes")
+BAMBU_REMAINING_MINUTES = Gauge(
+    "bambu_remaining_time_minutes",
+    "Reported remaining time in minutes (mc_remaining_time)",
+    ["printer_id"],
+)
+_unregister_metric_if_exists("bambu_layer_number")
+BAMBU_LAYER = Gauge("bambu_layer_number", "Current layer number", ["printer_id"])
+_unregister_metric_if_exists("bambu_total_layers")
+BAMBU_TOTAL_LAYERS = Gauge(
+    "bambu_total_layers", "Total layers in the print", ["printer_id"]
+)
+_unregister_metric_if_exists("bambu_nozzle_temperature_celsius")
+BAMBU_NOZZLE_TEMP = Gauge(
+    "bambu_nozzle_temperature_celsius",
+    "Current nozzle temperature in Celsius",
+    ["printer_id"],
+)
+_unregister_metric_if_exists("bambu_nozzle_target_temperature_celsius")
+BAMBU_NOZZLE_TARGET_TEMP = Gauge(
+    "bambu_nozzle_target_temperature_celsius",
+    "Target nozzle temperature in Celsius",
+    ["printer_id"],
+)
+_unregister_metric_if_exists("bambu_bed_temperature_celsius")
+BAMBU_BED_TEMP = Gauge(
+    "bambu_bed_temperature_celsius",
+    "Current bed temperature in Celsius",
+    ["printer_id"],
+)
+_unregister_metric_if_exists("bambu_bed_target_temperature_celsius")
+BAMBU_BED_TARGET_TEMP = Gauge(
+    "bambu_bed_target_temperature_celsius",
+    "Target bed temperature in Celsius",
+    ["printer_id"],
+)
+_unregister_metric_if_exists("bambu_chamber_temperature_celsius")
+BAMBU_CHAMBER_TEMP = Gauge(
+    "bambu_chamber_temperature_celsius",
+    "Current chamber temperature in Celsius",
+    ["printer_id"],
+)
+_unregister_metric_if_exists("bambu_print_speed_percent")
+BAMBU_PRINT_SPEED = Gauge(
+    "bambu_print_speed_percent", "Print speed percentage", ["printer_id"]
+)
+_unregister_metric_if_exists("bambu_cooling_fan_speed_percent")
+BAMBU_COOLING_FAN_SPEED = Gauge(
+    "bambu_cooling_fan_speed_percent", "Cooling fan speed percentage", ["printer_id"]
+)
+_unregister_metric_if_exists("bambu_heatbreak_fan_speed_rpm")
+BAMBU_HEATBREAK_FAN_SPEED = Gauge(
+    "bambu_heatbreak_fan_speed_rpm", "Heatbreak fan speed RPM", ["printer_id"]
+)
+_unregister_metric_if_exists("bambu_print_error_code")
+BAMBU_PRINT_ERROR = Gauge(
+    "bambu_print_error_code", "Print error code (0=no error)", ["printer_id"]
+)
+_unregister_metric_if_exists("bambu_wifi_signal_dbm")
+BAMBU_WIFI_SIGNAL = Gauge(
+    "bambu_wifi_signal_dbm", "WiFi signal strength in dBm", ["printer_id"]
+)
 
 
 def _to_epoch_seconds(dt: Optional[datetime]) -> float:
@@ -1732,14 +1958,6 @@ class PrinterMetricsCollector:
         yield g_metrics_extraction_count
 
 
-# Register collector once
-try:
-    REGISTRY.register(PrinterMetricsCollector())
-except ValueError:
-    # Already registered (e.g., in reloadable environments)
-    pass
-
-
 # Expose /metrics for Prometheus scrapes
 @app.get("/metrics")
 async def metrics_endpoint():
@@ -1753,6 +1971,71 @@ async def metrics_endpoint():
 async def maybe_notify_on_update(
     pstate: PrinterState, new_status: Dict[str, Any]
 ) -> None:
+    pid = pstate.printer_id
+    try:
+        BAMBU_LAST_STATUS_TIMESTAMP.labels(printer_id=pid).set_to_current_time()
+        BAMBU_PRINT_ACTIVE.labels(printer_id=pid).set(
+            1 if is_print_active(new_status) else 0
+        )
+
+        percent = _maybe_parse_number(new_status.get("mc_percent"))
+        if percent is not None:
+            BAMBU_PROGRESS_PERCENT.labels(printer_id=pid).set(percent)
+
+        rem_time = _maybe_parse_number(new_status.get("mc_remaining_time"))
+        if rem_time is not None:
+            BAMBU_REMAINING_MINUTES.labels(printer_id=pid).set(rem_time)
+
+        layer = _maybe_parse_number(new_status.get("layer_num"))
+        if layer is not None:
+            BAMBU_LAYER.labels(printer_id=pid).set(layer)
+
+        total_layers = _maybe_parse_number(new_status.get("total_layer_num"))
+        if total_layers is not None:
+            BAMBU_TOTAL_LAYERS.labels(printer_id=pid).set(total_layers)
+
+        nozzle_temp = _maybe_parse_number(new_status.get("nozzle_temper"))
+        if nozzle_temp is not None:
+            BAMBU_NOZZLE_TEMP.labels(printer_id=pid).set(nozzle_temp)
+
+        nozzle_target = _maybe_parse_number(new_status.get("nozzle_target_temper"))
+        if nozzle_target is not None:
+            BAMBU_NOZZLE_TARGET_TEMP.labels(printer_id=pid).set(nozzle_target)
+
+        bed_temp = _maybe_parse_number(new_status.get("bed_temper"))
+        if bed_temp is not None:
+            BAMBU_BED_TEMP.labels(printer_id=pid).set(bed_temp)
+
+        bed_target = _maybe_parse_number(new_status.get("bed_target_temper"))
+        if bed_target is not None:
+            BAMBU_BED_TARGET_TEMP.labels(printer_id=pid).set(bed_target)
+
+        chamber_temp = _maybe_parse_number(new_status.get("chamber_temper"))
+        if chamber_temp is not None:
+            BAMBU_CHAMBER_TEMP.labels(printer_id=pid).set(chamber_temp)
+
+        speed = _maybe_parse_number(new_status.get("spd_mag"))
+        if speed is not None:
+            BAMBU_PRINT_SPEED.labels(printer_id=pid).set(speed)
+
+        fan_cool = _maybe_parse_number(new_status.get("cooling_fan_speed"))
+        if fan_cool is not None:
+            BAMBU_COOLING_FAN_SPEED.labels(printer_id=pid).set(fan_cool)
+
+        fan_hb = _maybe_parse_number(new_status.get("heatbreak_fan_speed"))
+        if fan_hb is not None:
+            BAMBU_HEATBREAK_FAN_SPEED.labels(printer_id=pid).set(fan_hb)
+
+        error_code = _maybe_parse_number(new_status.get("print_error"))
+        if error_code is not None:
+            BAMBU_PRINT_ERROR.labels(printer_id=pid).set(error_code)
+
+        wifi = _maybe_parse_number(new_status.get("wifi_signal"))
+        if wifi is not None:
+            BAMBU_WIFI_SIGNAL.labels(printer_id=pid).set(wifi)
+
+    except Exception as e:
+        logger.warning("[%s] Failed to update metrics from WebSocket: %s", pid, e)
     prev = pstate.prev_status or {}
     new_state = (safe_get(new_status, "gcode_state") or "").upper()
     old_state = (safe_get(prev, "gcode_state") or "").upper()
@@ -2036,12 +2319,13 @@ _photo_task: Optional[asyncio.Task] = None
 _http_seed_task: Optional[asyncio.Task] = None
 
 
-@app.on_event("startup")
-async def on_startup():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan context."""
+    global _ws_task, _photo_task, _http_seed_task
     logger.info(
-        "Starting app. PRINTER_ID=%s | WS_URL=%s | PHOTO_INTERVAL_SECONDS=%s | IMAGE_TIMEOUT_SECONDS=%s",
+        "Starting app. PRINTER_ID=%s | PHOTO_INTERVAL_SECONDS=%s | IMAGE_TIMEOUT_SECONDS=%s",
         PRINTER_ID,
-        WS_URL,
         PHOTO_INTERVAL_SECONDS,
         IMAGE_TIMEOUT_SECONDS,
     )
@@ -2051,11 +2335,12 @@ async def on_startup():
         HTTP_STATUS_URL_TEMPLATE,
         HTTP_STATUS_SEED_INTERVAL_SECONDS,
     )
-    global _ws_task, _photo_task, _http_seed_task
+
     # In dynamic mode, we start a discovery loop that will spawn per-printer WS tasks.
     _ws_task = asyncio.create_task(printers_discovery_loop())
     _photo_task = asyncio.create_task(photo_loop())
     _http_seed_task = asyncio.create_task(http_status_seed_loop())
+
     if ai_is_enabled():
         # Warm up AI client early to pay the init cost upfront
         try:
@@ -2068,12 +2353,11 @@ async def on_startup():
         except Exception:
             logger.warning("AI client initialization skipped or failed.")
 
+    yield
 
-@app.on_event("shutdown")
-async def on_shutdown():
     logger.info("Shutting down...")
     state.run_event.clear()
-    global _ws_task, _photo_task, _http_seed_task
+
     for task in (_ws_task, _photo_task, _http_seed_task):
         if task and not task.done():
             task.cancel()
@@ -2081,13 +2365,16 @@ async def on_shutdown():
                 await task
             except asyncio.CancelledError:
                 pass
+
     _ws_task = None
     _photo_task = None
     _http_seed_task = None
+
     # Cancel per-printer WS tasks
     async with state.lock:
         tasks = list(state.ws_tasks.values())
         state.ws_tasks.clear()
+
     for t in tasks:
         if t and not t.done():
             t.cancel()
@@ -2095,9 +2382,9 @@ async def on_shutdown():
                 await t
             except asyncio.CancelledError:
                 pass
+
     if state.http_session and not state.http_session.closed:
         await state.http_session.close()
-    # No explicit close needed for AsyncOpenAI
 
 
 # -----------------------------------------------------------------------------
