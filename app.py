@@ -40,6 +40,19 @@ WS_URL_TEMPLATE = os.getenv(
     "WS_URL_TEMPLATE", "wss://print.lo.f0rth.space/ws/printer/{printer_id}"
 )
 
+# Optional HTTP status fallback/seed (helps populate metrics before WS delivers)
+HTTP_STATUS_URL_TEMPLATE = os.getenv(
+    "HTTP_STATUS_URL_TEMPLATE", "https://print.lo.f0rth.space/api/printer/{printer_id}"
+)
+HTTP_STATUS_SEED_ON_STARTUP = os.getenv("HTTP_STATUS_SEED_ON_STARTUP", "1") not in {
+    "0",
+    "false",
+    "False",
+}
+HTTP_STATUS_SEED_INTERVAL_SECONDS = int(
+    os.getenv("HTTP_STATUS_SEED_INTERVAL_SECONDS", "10")
+)
+
 PORT = int(os.getenv("PORT", "8000"))
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -110,6 +123,8 @@ class PrinterState:
         self.printer_id = printer_id
         self.model = model
         self.is_online: bool = False
+        # If true, we will always maintain a WS connection regardless of discovery status.
+        self.always_connect: bool = False
 
         self.lock = asyncio.Lock()
         self.latest_status: Optional[Dict[str, Any]] = None
@@ -167,6 +182,7 @@ class AppState:
             try:
                 self.printers[PRINTER_ID] = PrinterState(PRINTER_ID)
                 self.printers[PRINTER_ID].is_online = True
+                self.printers[PRINTER_ID].always_connect = True
             except Exception:
                 pass
 
@@ -191,6 +207,16 @@ def safe_get(d: Optional[Dict[str, Any]], *path, default=None):
             return default
         cur = cur[key]
     return cur
+
+
+def parse_iso8601(ts: Optional[str]) -> Optional[datetime]:
+    if not ts:
+        return None
+    try:
+        # Replace trailing Z with explicit UTC offset to support older Python formats
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except Exception:
+        return None
 
 
 async def ensure_http_session() -> aiohttp.ClientSession:
@@ -258,14 +284,26 @@ async def printers_discovery_loop() -> None:
             if PRINTER_ID not in state.printers:
                 state.printers[PRINTER_ID] = PrinterState(PRINTER_ID)
                 state.printers[PRINTER_ID].is_online = True
+                state.printers[PRINTER_ID].always_connect = True
 
     refresh = max(60, PRINTERS_REFRESH_SECONDS)
     while state.run_event.is_set():
         try:
+            # Start/ensure WS tasks for known printers first, so a slow discovery fetch cannot block WS
+            async with state.lock:
+                printers_snapshot = list(state.printers.values())
+            for p in printers_snapshot:
+                if p.is_online or p.always_connect:
+                    await _start_ws_task_if_needed(p)
+                else:
+                    await _stop_ws_task_if_running(p.printer_id)
+
             session = await ensure_http_session()
             fetched: List[Dict[str, Any]] = []
             try:
-                async with session.get(PRINTERS_API_URL) as resp:
+                # Use a short per-request timeout so we don't stall the loop
+                req_timeout = aiohttp.ClientTimeout(total=5, connect=3)
+                async with session.get(PRINTERS_API_URL, timeout=req_timeout) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         if isinstance(data, list):
@@ -319,7 +357,7 @@ async def printers_discovery_loop() -> None:
             async with state.lock:
                 printers_snapshot = list(state.printers.values())
             for p in printers_snapshot:
-                if p.is_online:
+                if p.is_online or p.always_connect:
                     await _start_ws_task_if_needed(p)
                 else:
                     await _stop_ws_task_if_running(p.printer_id)
@@ -328,6 +366,50 @@ async def printers_discovery_loop() -> None:
             logger.exception("Discovery loop error: %s", e)
 
         await asyncio.sleep(refresh)
+
+
+async def http_status_seed_loop() -> None:
+    """Periodically seed latest_status via HTTP API to populate metrics early.
+
+    This complements the WebSocket stream and is controlled by
+    HTTP_STATUS_SEED_ON_STARTUP and HTTP_STATUS_SEED_INTERVAL_SECONDS.
+    """
+    if not HTTP_STATUS_SEED_ON_STARTUP:
+        return
+    interval = max(2, HTTP_STATUS_SEED_INTERVAL_SECONDS)
+    while state.run_event.is_set():
+        try:
+            session = await ensure_http_session()
+            async with state.lock:
+                ids = list(state.printers.keys())
+            for pid in ids:
+                url = HTTP_STATUS_URL_TEMPLATE.format(printer_id=pid)
+                try:
+                    req_timeout = aiohttp.ClientTimeout(total=5, connect=3)
+                    async with session.get(url, timeout=req_timeout) as resp:
+                        if resp.status != 200:
+                            continue
+                        data = await resp.json()
+                        if not isinstance(data, dict):
+                            continue
+                        status = data.get("status")
+                        if not isinstance(status, dict):
+                            continue
+                        ts = data.get("received_at")
+                        parsed_ts = parse_iso8601(ts) if isinstance(ts, str) else None
+                        if parsed_ts is None:
+                            parsed_ts = now_utc()
+                        p = state.printers.get(pid)
+                        if p is None:
+                            continue
+                        async with p.lock:
+                            p.latest_status = status
+                            p.latest_status_ts = parsed_ts
+                except Exception as e:
+                    logger.debug("HTTP status seed for %s failed: %s", pid, e)
+        except Exception as e:
+            logger.debug("HTTP status seed loop error: %s", e)
+        await asyncio.sleep(interval)
 
 
 def ensure_images_dir(
@@ -1611,6 +1693,7 @@ app.include_router(router)
 # -----------------------------------------------------------------------------
 _ws_task: Optional[asyncio.Task] = None
 _photo_task: Optional[asyncio.Task] = None
+_http_seed_task: Optional[asyncio.Task] = None
 
 
 @app.on_event("startup")
@@ -1622,10 +1705,11 @@ async def on_startup():
         PHOTO_INTERVAL_SECONDS,
         IMAGE_TIMEOUT_SECONDS,
     )
-    global _ws_task, _photo_task
+    global _ws_task, _photo_task, _http_seed_task
     # In dynamic mode, we start a discovery loop that will spawn per-printer WS tasks.
     _ws_task = asyncio.create_task(printers_discovery_loop())
     _photo_task = asyncio.create_task(photo_loop())
+    _http_seed_task = asyncio.create_task(http_status_seed_loop())
     if ai_is_enabled():
         # Warm up AI client early to pay the init cost upfront
         try:
@@ -1643,8 +1727,8 @@ async def on_startup():
 async def on_shutdown():
     logger.info("Shutting down...")
     state.run_event.clear()
-    global _ws_task, _photo_task
-    for task in (_ws_task, _photo_task):
+    global _ws_task, _photo_task, _http_seed_task
+    for task in (_ws_task, _photo_task, _http_seed_task):
         if task and not task.done():
             task.cancel()
             try:
@@ -1653,6 +1737,7 @@ async def on_shutdown():
                 pass
     _ws_task = None
     _photo_task = None
+    _http_seed_task = None
     # Cancel per-printer WS tasks
     async with state.lock:
         tasks = list(state.ws_tasks.values())
