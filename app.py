@@ -20,6 +20,8 @@ except Exception:  # pragma: no cover
 from fastapi import FastAPI, APIRouter, Response, HTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse
 import uvicorn
+from prometheus_client import REGISTRY, generate_latest, CONTENT_TYPE_LATEST  # type: ignore[import-not-found]
+from prometheus_client.core import GaugeMetricFamily  # type: ignore[import-not-found]
 
 # -----------------------------------------------------------------------------
 # Configuration
@@ -1133,6 +1135,266 @@ async def websocket_loop_for_printer(pstate: PrinterState) -> None:
         backoff = min(backoff * 2, RECONNECT_MAX_SECONDS)
 
     logger.info("[%s] WebSocket loop exited.", pstate.printer_id)
+
+
+# -----------------------------------------------------------------------------
+# Prometheus Exporter
+# -----------------------------------------------------------------------------
+
+
+def _to_epoch_seconds(dt: Optional[datetime]) -> float:
+    if not dt:
+        return 0.0
+    return dt.timestamp()
+
+
+def _maybe_parse_number(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return 1.0 if value else 0.0
+    if isinstance(value, (int, float)):
+        try:
+            return float(value)
+        except Exception:
+            return None
+    if isinstance(value, str):
+        s = value.strip()
+        # Try exact numeric first
+        try:
+            return float(s)
+        except Exception:
+            pass
+        # Try to extract a leading numeric (e.g., "-59dBm")
+        sign = 1.0
+        if s.startswith("-"):
+            sign = -1.0
+            s = s[1:]
+        num = []
+        dot_seen = False
+        for ch in s:
+            if ch.isdigit():
+                num.append(ch)
+            elif ch == "." and not dot_seen:
+                dot_seen = True
+                num.append(ch)
+            else:
+                break
+        if num and not (len(num) == 1 and num[0] == "."):
+            try:
+                return float("".join(num)) * sign
+            except Exception:
+                return None
+    return None
+
+
+def _walk_status(
+    path: str, value: Any, add_number, add_bool, add_string, index: str = ""
+) -> None:
+    # path should not include a leading dot; represent full path like 'status.nozzle_temper'
+    if isinstance(value, dict):
+        for k in sorted(value.keys()):
+            _walk_status(
+                f"{path}.{k}" if path else k,
+                value[k],
+                add_number,
+                add_bool,
+                add_string,
+                index="",
+            )
+        return
+    if isinstance(value, list):
+        for i, item in enumerate(value):
+            _walk_status(
+                f"{path}[{i}]", item, add_number, add_bool, add_string, index=str(i)
+            )
+        return
+
+    # Leaf value
+    if isinstance(value, bool):
+        add_bool(path, 1.0 if value else 0.0, index)
+        add_string(path, "true" if value else "false", index)
+        return
+
+    num = _maybe_parse_number(value)
+    if num is not None:
+        add_number(path, num, index)
+        # Also expose string form to allow state queries (e.g., RUNNING)
+        if isinstance(value, str):
+            add_string(path, value, index)
+        return
+
+    # Non-numeric string or unknown type → expose as string info
+    if isinstance(value, str):
+        add_string(path, value, index)
+    # Other types (None, etc.) are skipped
+
+
+class PrinterMetricsCollector:
+    def collect(self):  # type: ignore[override]
+        # Per-printer gauges
+        g_up = GaugeMetricFamily(
+            "bambu_printer_up",
+            "Printer online status from discovery (1=online,0=offline)",
+            labels=["printer_id"],
+        )
+        g_has_status = GaugeMetricFamily(
+            "bambu_printer_has_status",
+            "Whether any status has been received for this printer",
+            labels=["printer_id"],
+        )
+        g_has_image = GaugeMetricFamily(
+            "bambu_printer_has_image",
+            "Whether any image has been received for this printer",
+            labels=["printer_id"],
+        )
+        g_active = GaugeMetricFamily(
+            "bambu_printer_is_active",
+            "Whether a print appears active based on status",
+            labels=["printer_id"],
+        )
+        g_last_status_ts = GaugeMetricFamily(
+            "bambu_printer_last_status_timestamp_seconds",
+            "Unix timestamp of the last received status for this printer",
+            labels=["printer_id"],
+        )
+        g_last_image_ts = GaugeMetricFamily(
+            "bambu_printer_last_image_timestamp_seconds",
+            "Unix timestamp of the last received image for this printer",
+            labels=["printer_id"],
+        )
+        g_image_seq = GaugeMetricFamily(
+            "bambu_printer_image_seq",
+            "Monotonic counter of frames observed in the current process",
+            labels=["printer_id"],
+        )
+        g_progress = GaugeMetricFamily(
+            "bambu_progress_percent",
+            "Current reported print progress percent (mc_percent)",
+            labels=["printer_id"],
+        )
+        g_remaining = GaugeMetricFamily(
+            "bambu_remaining_time_minutes",
+            "Reported remaining time in minutes (mc_remaining_time)",
+            labels=["printer_id"],
+        )
+        g_layer = GaugeMetricFamily(
+            "bambu_layer_number",
+            "Current layer number (layer_num)",
+            labels=["printer_id"],
+        )
+        g_total_layer = GaugeMetricFamily(
+            "bambu_total_layers",
+            "Total layer number (total_layer_num)",
+            labels=["printer_id"],
+        )
+
+        # Generic flattened families
+        g_number = GaugeMetricFamily(
+            "bambu_status_number",
+            "All numeric values extracted from the latest status. Labels: path=indexed dotted path, index=list index if any.",
+            labels=["printer_id", "path", "index"],
+        )
+        g_bool = GaugeMetricFamily(
+            "bambu_status_bool",
+            "All boolean values as 0/1 extracted from the latest status.",
+            labels=["printer_id", "path", "index"],
+        )
+        g_string = GaugeMetricFamily(
+            "bambu_status_string_info",
+            "All string values from the latest status, as a constant 1 metric with the value in a label.",
+            labels=["printer_id", "path", "index", "value"],
+        )
+
+        # Snapshot printers without awaiting async locks
+        try:
+            printers_list = list(state.printers.values())
+        except Exception:
+            printers_list = []
+
+        for p in printers_list:
+            pid = p.printer_id
+            status = p.latest_status
+            last_status_ts = p.latest_status_ts
+            has_status = 1.0 if status is not None else 0.0
+            has_image = 1.0 if p.latest_image_bytes is not None else 0.0
+            is_active = 1.0 if is_print_active(status) else 0.0
+
+            g_up.add_metric([pid], 1.0 if p.is_online else 0.0)
+            g_has_status.add_metric([pid], has_status)
+            g_has_image.add_metric([pid], has_image)
+            g_active.add_metric([pid], is_active)
+            g_last_status_ts.add_metric([pid], _to_epoch_seconds(last_status_ts))
+            g_last_image_ts.add_metric([pid], _to_epoch_seconds(p.latest_image_ts))
+            g_image_seq.add_metric([pid], float(p.image_seq))
+
+            # Derived convenience metrics
+            if status is not None:
+                percent = safe_get(status, "mc_percent")
+                if percent is not None:
+                    num = _maybe_parse_number(percent)
+                    if num is not None:
+                        g_progress.add_metric([pid], num)
+                rem = safe_get(status, "mc_remaining_time")
+                if rem is not None:
+                    num = _maybe_parse_number(rem)
+                    if num is not None:
+                        g_remaining.add_metric([pid], num)
+                layer_num = safe_get(status, "layer_num")
+                if layer_num is not None:
+                    num = _maybe_parse_number(layer_num)
+                    if num is not None:
+                        g_layer.add_metric([pid], num)
+                total_layer_num = safe_get(status, "total_layer_num")
+                if total_layer_num is not None:
+                    num = _maybe_parse_number(total_layer_num)
+                    if num is not None:
+                        g_total_layer.add_metric([pid], num)
+
+                # Flatten all status fields
+                def add_num(path: str, val: float, index: str = "") -> None:
+                    g_number.add_metric([pid, f"status.{path}", index or ""], val)
+
+                def add_b(path: str, val: float, index: str = "") -> None:
+                    g_bool.add_metric([pid, f"status.{path}", index or ""], val)
+
+                def add_str(path: str, sval: str, index: str = "") -> None:
+                    # Limit very long strings to avoid huge scrapes
+                    s = sval if len(sval) <= 200 else (sval[:197] + "...")
+                    g_string.add_metric([pid, f"status.{path}", index or "", s], 1.0)
+
+                _walk_status("", status, add_num, add_b, add_str)
+
+        # Yield families
+        yield g_up
+        yield g_has_status
+        yield g_has_image
+        yield g_active
+        yield g_last_status_ts
+        yield g_last_image_ts
+        yield g_image_seq
+        yield g_progress
+        yield g_remaining
+        yield g_layer
+        yield g_total_layer
+        yield g_number
+        yield g_bool
+        yield g_string
+
+
+# Register collector once
+try:
+    REGISTRY.register(PrinterMetricsCollector())
+except ValueError:
+    # Already registered (e.g., in reloadable environments)
+    pass
+
+
+# Expose /metrics for Prometheus scrapes
+@app.get("/metrics")
+async def metrics_endpoint():
+    content = generate_latest(REGISTRY)
+    return Response(content=content, media_type=CONTENT_TYPE_LATEST)
 
 
 # -----------------------------------------------------------------------------

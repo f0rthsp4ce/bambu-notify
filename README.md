@@ -24,6 +24,7 @@ A tiny FastAPI + aiohttp service that:
 - `GET /api/printers` → list known printers `{ printer_id, model, is_online, has_status }`
 - `GET /api/printer/{printer_id}` → latest JSON status for that printer
 - `GET /api/printer/{printer_id}/image` → latest JPEG frame (binary) for that printer
+- `GET /metrics` → Prometheus metrics for all discovered printers and latest status fields
 
 > Back-compat: if you still rely on a fixed `PRINTER_ID`, the same paths work:
 > - `GET /api/printer/A1M-1`
@@ -84,6 +85,7 @@ curl -s -o frame.jpg http://localhost:8000/api/printer/A1M-1/image
 python3 -m venv .venv && source .venv/bin/activate
 pip install fastapi==0.115.0 "uvicorn[standard]==0.30.6" aiohttp==3.10.5
 pip install openai==1.99.9
+pip install prometheus-client==0.20.0
 
 export TELEGRAM_BOT_TOKEN=123456:ABCDEF...
 export TELEGRAM_CHAT_ID=-1001234567890
@@ -100,6 +102,7 @@ export OPENROUTER_API_KEY=sk-or-...
 
 python app.py
 # API at: http://localhost:8000/api/...
+# Metrics at: http://localhost:8000/metrics
 ```
 
 ## Run via Docker
@@ -179,6 +182,33 @@ Notes:
 * Ensure your bot has permission to post photos in the destination chat/thread.
 * Use a reverse proxy (nginx/traefik) for TLS/ingress in production.
 * Health check: `GET /api/` returns `OK`. You can add readiness checks to also verify `latest_status_ts` recency if desired.
+
+### Prometheus
+
+Scrape the `/metrics` endpoint. Example scrape config:
+
+```yaml
+scrape_configs:
+  - job_name: bambu_notify
+    static_configs:
+      - targets: ["localhost:8000"]
+```
+
+Exported metrics include:
+- `bambu_printer_up{printer_id}`: 1 if printer marked online by discovery
+- `bambu_printer_has_status{printer_id}`: status seen
+- `bambu_printer_has_image{printer_id}`: image seen
+- `bambu_printer_is_active{printer_id}`: active print heuristic
+- `bambu_printer_last_status_timestamp_seconds{printer_id}`
+- `bambu_printer_last_image_timestamp_seconds{printer_id}`
+- `bambu_printer_image_seq{printer_id}`
+- `bambu_progress_percent{printer_id}`
+- `bambu_remaining_time_minutes{printer_id}`
+- `bambu_layer_number{printer_id}`, `bambu_total_layers{printer_id}`
+- Flattened status values:
+  - `bambu_status_number{printer_id,path,index}`: numeric fields
+  - `bambu_status_bool{printer_id,path,index}`: boolean fields as 0/1
+  - `bambu_status_string_info{printer_id,path,index,value}`: string fields as info
 
 ## License
 
