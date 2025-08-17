@@ -113,8 +113,8 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 # Ensure our logger shows debug messages
-logger.setLevel(logging.DEBUG)
 logger = logging.getLogger("printer-ws")
+logger.setLevel(logging.DEBUG)
 
 
 # -----------------------------------------------------------------------------
