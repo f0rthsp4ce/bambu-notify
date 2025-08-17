@@ -382,12 +382,16 @@ async def http_status_seed_loop() -> None:
             session = await ensure_http_session()
             async with state.lock:
                 ids = list(state.printers.keys())
+            logger.debug("HTTP status seeding for %d printers: %s", len(ids), ids)
             for pid in ids:
                 url = HTTP_STATUS_URL_TEMPLATE.format(printer_id=pid)
                 try:
                     req_timeout = aiohttp.ClientTimeout(total=5, connect=3)
                     async with session.get(url, timeout=req_timeout) as resp:
                         if resp.status != 200:
+                            logger.debug(
+                                "HTTP status seed for %s: HTTP %d", pid, resp.status
+                            )
                             continue
                         data = await resp.json()
                         if not isinstance(data, dict):
@@ -405,8 +409,13 @@ async def http_status_seed_loop() -> None:
                         async with p.lock:
                             p.latest_status = status
                             p.latest_status_ts = parsed_ts
+                        logger.debug(
+                            "HTTP status seed for %s: updated with %d status fields",
+                            pid,
+                            len(status),
+                        )
                 except Exception as e:
-                    logger.debug("HTTP status seed for %s failed: %s", pid, e)
+                    logger.warning("HTTP status seed for %s failed: %s", pid, e)
         except Exception as e:
             logger.debug("HTTP status seed loop error: %s", e)
         await asyncio.sleep(interval)
@@ -1379,6 +1388,62 @@ class PrinterMetricsCollector:
             labels=["printer_id"],
         )
 
+        # Temperature metrics
+        g_nozzle_temp = GaugeMetricFamily(
+            "bambu_nozzle_temperature_celsius",
+            "Current nozzle temperature in Celsius",
+            labels=["printer_id"],
+        )
+        g_nozzle_target_temp = GaugeMetricFamily(
+            "bambu_nozzle_target_temperature_celsius",
+            "Target nozzle temperature in Celsius",
+            labels=["printer_id"],
+        )
+        g_bed_temp = GaugeMetricFamily(
+            "bambu_bed_temperature_celsius",
+            "Current bed temperature in Celsius",
+            labels=["printer_id"],
+        )
+        g_bed_target_temp = GaugeMetricFamily(
+            "bambu_bed_target_temperature_celsius",
+            "Target bed temperature in Celsius",
+            labels=["printer_id"],
+        )
+        g_chamber_temp = GaugeMetricFamily(
+            "bambu_chamber_temperature_celsius",
+            "Current chamber temperature in Celsius",
+            labels=["printer_id"],
+        )
+
+        # Speed and fan metrics
+        g_print_speed = GaugeMetricFamily(
+            "bambu_print_speed_percent",
+            "Print speed percentage",
+            labels=["printer_id"],
+        )
+        g_cooling_fan_speed = GaugeMetricFamily(
+            "bambu_cooling_fan_speed",
+            "Cooling fan speed",
+            labels=["printer_id"],
+        )
+        g_heatbreak_fan_speed = GaugeMetricFamily(
+            "bambu_heatbreak_fan_speed",
+            "Heatbreak fan speed",
+            labels=["printer_id"],
+        )
+
+        # Print state metrics
+        g_print_error = GaugeMetricFamily(
+            "bambu_print_error_code",
+            "Print error code (0 = no error)",
+            labels=["printer_id"],
+        )
+        g_wifi_signal = GaugeMetricFamily(
+            "bambu_wifi_signal_dbm",
+            "WiFi signal strength in dBm",
+            labels=["printer_id"],
+        )
+
         # Generic flattened families
         g_number = GaugeMetricFamily(
             "bambu_status_number",
@@ -1396,27 +1461,55 @@ class PrinterMetricsCollector:
             labels=["printer_id", "path", "index", "value"],
         )
 
-        # Snapshot printers without awaiting async locks
-        try:
-            printers_list = list(state.printers.values())
-        except Exception:
-            printers_list = []
+        # Debug metrics
+        g_metrics_extraction_count = GaugeMetricFamily(
+            "bambu_metrics_extraction_count",
+            "Count of metrics extracted per type for debugging",
+            labels=["printer_id", "type"],
+        )
 
-        for p in printers_list:
-            pid = p.printer_id
-            status = p.latest_status
-            last_status_ts = p.latest_status_ts
+        # Snapshot printers with proper data access
+        try:
+            # Get a snapshot of all printer data safely
+            printers_data = []
+            for printer_id, p in state.printers.items():
+                try:
+                    # Capture all needed data in one go to avoid race conditions
+                    printer_data = {
+                        "printer_id": printer_id,
+                        "is_online": p.is_online,
+                        "latest_status": p.latest_status,
+                        "latest_status_ts": p.latest_status_ts,
+                        "latest_image_bytes": p.latest_image_bytes,
+                        "latest_image_ts": p.latest_image_ts,
+                        "image_seq": p.image_seq,
+                    }
+                    printers_data.append(printer_data)
+                except Exception as e:
+                    logger.debug(
+                        f"Failed to capture data for printer {printer_id}: {e}"
+                    )
+                    continue
+        except Exception:
+            printers_data = []
+
+        for printer_data in printers_data:
+            pid = printer_data["printer_id"]
+            status = printer_data["latest_status"]
+            last_status_ts = printer_data["latest_status_ts"]
             has_status = 1.0 if status is not None else 0.0
-            has_image = 1.0 if p.latest_image_bytes is not None else 0.0
+            has_image = 1.0 if printer_data["latest_image_bytes"] is not None else 0.0
             is_active = 1.0 if is_print_active(status) else 0.0
 
-            g_up.add_metric([pid], 1.0 if p.is_online else 0.0)
+            g_up.add_metric([pid], 1.0 if printer_data["is_online"] else 0.0)
             g_has_status.add_metric([pid], has_status)
             g_has_image.add_metric([pid], has_image)
             g_active.add_metric([pid], is_active)
             g_last_status_ts.add_metric([pid], _to_epoch_seconds(last_status_ts))
-            g_last_image_ts.add_metric([pid], _to_epoch_seconds(p.latest_image_ts))
-            g_image_seq.add_metric([pid], float(p.image_seq))
+            g_last_image_ts.add_metric(
+                [pid], _to_epoch_seconds(printer_data["latest_image_ts"])
+            )
+            g_image_seq.add_metric([pid], float(printer_data["image_seq"]))
 
             # Derived convenience metrics
             if status is not None:
@@ -1441,19 +1534,108 @@ class PrinterMetricsCollector:
                     if num is not None:
                         g_total_layer.add_metric([pid], num)
 
+                # Temperature metrics
+                nozzle_temp = safe_get(status, "nozzle_temper")
+                if nozzle_temp is not None:
+                    num = _maybe_parse_number(nozzle_temp)
+                    if num is not None:
+                        g_nozzle_temp.add_metric([pid], num)
+
+                nozzle_target_temp = safe_get(status, "nozzle_target_temper")
+                if nozzle_target_temp is not None:
+                    num = _maybe_parse_number(nozzle_target_temp)
+                    if num is not None:
+                        g_nozzle_target_temp.add_metric([pid], num)
+
+                bed_temp = safe_get(status, "bed_temper")
+                if bed_temp is not None:
+                    num = _maybe_parse_number(bed_temp)
+                    if num is not None:
+                        g_bed_temp.add_metric([pid], num)
+
+                bed_target_temp = safe_get(status, "bed_target_temper")
+                if bed_target_temp is not None:
+                    num = _maybe_parse_number(bed_target_temp)
+                    if num is not None:
+                        g_bed_target_temp.add_metric([pid], num)
+
+                chamber_temp = safe_get(status, "chamber_temper")
+                if chamber_temp is not None:
+                    num = _maybe_parse_number(chamber_temp)
+                    if num is not None:
+                        g_chamber_temp.add_metric([pid], num)
+
+                # Speed and fan metrics
+                print_speed = safe_get(status, "spd_mag")
+                if print_speed is not None:
+                    num = _maybe_parse_number(print_speed)
+                    if num is not None:
+                        g_print_speed.add_metric([pid], num)
+
+                cooling_fan = safe_get(status, "cooling_fan_speed")
+                if cooling_fan is not None:
+                    num = _maybe_parse_number(cooling_fan)
+                    if num is not None:
+                        g_cooling_fan_speed.add_metric([pid], num)
+
+                heatbreak_fan = safe_get(status, "heatbreak_fan_speed")
+                if heatbreak_fan is not None:
+                    num = _maybe_parse_number(heatbreak_fan)
+                    if num is not None:
+                        g_heatbreak_fan_speed.add_metric([pid], num)
+
+                # Print state metrics
+                print_error = safe_get(status, "print_error")
+                if print_error is not None:
+                    num = _maybe_parse_number(print_error)
+                    if num is not None:
+                        g_print_error.add_metric([pid], num)
+
+                wifi_signal = safe_get(status, "wifi_signal")
+                if wifi_signal is not None:
+                    num = _maybe_parse_number(wifi_signal)
+                    if num is not None:
+                        g_wifi_signal.add_metric([pid], num)
+
                 # Flatten all status fields
+                num_count = 0
+                bool_count = 0
+                string_count = 0
+
                 def add_num(path: str, val: float, index: str = "") -> None:
+                    nonlocal num_count
+                    num_count += 1
                     g_number.add_metric([pid, f"status.{path}", index or ""], val)
 
                 def add_b(path: str, val: float, index: str = "") -> None:
+                    nonlocal bool_count
+                    bool_count += 1
                     g_bool.add_metric([pid, f"status.{path}", index or ""], val)
 
                 def add_str(path: str, sval: str, index: str = "") -> None:
+                    nonlocal string_count
+                    string_count += 1
                     # Limit very long strings to avoid huge scrapes
                     s = sval if len(sval) <= 200 else (sval[:197] + "...")
                     g_string.add_metric([pid, f"status.{path}", index or "", s], 1.0)
 
                 _walk_status("", status, add_num, add_b, add_str)
+                logger.debug(
+                    "Metrics extraction for %s: %d numbers, %d bools, %d strings",
+                    pid,
+                    num_count,
+                    bool_count,
+                    string_count,
+                )
+
+                # Add debug metrics
+                g_metrics_extraction_count.add_metric(
+                    [pid, "numbers"], float(num_count)
+                )
+                g_metrics_extraction_count.add_metric([pid, "bools"], float(bool_count))
+                g_metrics_extraction_count.add_metric(
+                    [pid, "strings"], float(string_count)
+                )
 
         # Yield families
         yield g_up
@@ -1467,9 +1649,25 @@ class PrinterMetricsCollector:
         yield g_remaining
         yield g_layer
         yield g_total_layer
+        # Temperature metrics
+        yield g_nozzle_temp
+        yield g_nozzle_target_temp
+        yield g_bed_temp
+        yield g_bed_target_temp
+        yield g_chamber_temp
+        # Speed and fan metrics
+        yield g_print_speed
+        yield g_cooling_fan_speed
+        yield g_heatbreak_fan_speed
+        # Print state metrics
+        yield g_print_error
+        yield g_wifi_signal
+        # Generic flattened metrics
         yield g_number
         yield g_bool
         yield g_string
+        # Debug metrics
+        yield g_metrics_extraction_count
 
 
 # Register collector once
