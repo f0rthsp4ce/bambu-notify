@@ -162,6 +162,14 @@ class AppState:
         self.images_base_path: Path = Path(IMAGES_DIR)
         self.last_retention_cleanup_at: Optional[datetime] = None
 
+        # Seed a default printer immediately so metrics are not empty prior to discovery loop
+        if PRINTER_ID:
+            try:
+                self.printers[PRINTER_ID] = PrinterState(PRINTER_ID)
+                self.printers[PRINTER_ID].is_online = True
+            except Exception:
+                pass
+
 
 state = AppState()
 
