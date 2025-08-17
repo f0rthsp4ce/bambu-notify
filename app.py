@@ -112,6 +112,8 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
+# Ensure our logger shows debug messages
+logger.setLevel(logging.DEBUG)
 logger = logging.getLogger("printer-ws")
 
 
@@ -375,9 +377,17 @@ async def http_status_seed_loop() -> None:
     HTTP_STATUS_SEED_ON_STARTUP and HTTP_STATUS_SEED_INTERVAL_SECONDS.
     """
     if not HTTP_STATUS_SEED_ON_STARTUP:
+        logger.info("HTTP status seeding is DISABLED")
         return
     interval = max(2, HTTP_STATUS_SEED_INTERVAL_SECONDS)
+    logger.info("HTTP status seeding loop starting with %ds interval", interval)
+
+    # Do an immediate first seed on startup, then continue on interval
+    first_run = True
     while state.run_event.is_set():
+        if not first_run:
+            await asyncio.sleep(interval)
+        first_run = False
         try:
             session = await ensure_http_session()
             async with state.lock:
@@ -385,6 +395,7 @@ async def http_status_seed_loop() -> None:
             logger.debug("HTTP status seeding for %d printers: %s", len(ids), ids)
             for pid in ids:
                 url = HTTP_STATUS_URL_TEMPLATE.format(printer_id=pid)
+                logger.info("HTTP status seed for %s: requesting %s", pid, url)
                 try:
                     req_timeout = aiohttp.ClientTimeout(total=5, connect=3)
                     async with session.get(url, timeout=req_timeout) as resp:
@@ -409,16 +420,24 @@ async def http_status_seed_loop() -> None:
                         async with p.lock:
                             p.latest_status = status
                             p.latest_status_ts = parsed_ts
-                        logger.debug(
-                            "HTTP status seed for %s: updated with %d status fields",
+                        logger.info(
+                            "HTTP status seed for %s: SUCCESS - updated with %d status fields at %s",
                             pid,
                             len(status),
+                            parsed_ts.isoformat() if parsed_ts else "unknown",
+                        )
+                        # Log some key values for verification
+                        logger.info(
+                            "HTTP status seed for %s: mc_percent=%s, gcode_state=%s, nozzle_temp=%s",
+                            pid,
+                            status.get("mc_percent"),
+                            status.get("gcode_state"),
+                            status.get("nozzle_temper"),
                         )
                 except Exception as e:
                     logger.warning("HTTP status seed for %s failed: %s", pid, e)
         except Exception as e:
             logger.debug("HTTP status seed loop error: %s", e)
-        await asyncio.sleep(interval)
 
 
 def ensure_images_dir(
@@ -1472,6 +1491,9 @@ class PrinterMetricsCollector:
         try:
             # Get a snapshot of all printer data safely
             printers_data = []
+            logger.debug(
+                "Metrics collection: found %d printers in state", len(state.printers)
+            )
             for printer_id, p in state.printers.items():
                 try:
                     # Capture all needed data in one go to avoid race conditions
@@ -1485,12 +1507,28 @@ class PrinterMetricsCollector:
                         "image_seq": p.image_seq,
                     }
                     printers_data.append(printer_data)
+                    logger.info(
+                        "Metrics collection for %s: has_status=%s, is_online=%s, status_ts=%s",
+                        printer_id,
+                        p.latest_status is not None,
+                        p.is_online,
+                        p.latest_status_ts.isoformat()
+                        if p.latest_status_ts
+                        else "None",
+                    )
+                    if p.latest_status:
+                        logger.info(
+                            "Metrics collection for %s: status keys = %s",
+                            printer_id,
+                            list(p.latest_status.keys())[:10],
+                        )  # First 10 keys
                 except Exception as e:
                     logger.debug(
                         f"Failed to capture data for printer {printer_id}: {e}"
                     )
                     continue
-        except Exception:
+        except Exception as e:
+            logger.warning("Failed to snapshot printer data for metrics: %s", e)
             printers_data = []
 
         for printer_data in printers_data:
@@ -1820,6 +1858,86 @@ async def root():
     return "OK"
 
 
+@router.get("/debug/state")
+async def debug_state():
+    """Debug endpoint to see current printer state"""
+    async with state.lock:
+        debug_info = {}
+        for pid, p in state.printers.items():
+            debug_info[pid] = {
+                "is_online": p.is_online,
+                "has_status": p.latest_status is not None,
+                "status_timestamp": p.latest_status_ts.isoformat()
+                if p.latest_status_ts
+                else None,
+                "has_image": p.latest_image_bytes is not None,
+                "image_seq": p.image_seq,
+                "status_fields_count": len(p.latest_status) if p.latest_status else 0,
+                "sample_status_fields": list(p.latest_status.keys())[:10]
+                if p.latest_status
+                else [],
+            }
+    return JSONResponse(debug_info)
+
+
+@router.post("/debug/force-seed")
+async def force_seed():
+    """Force an immediate HTTP status seed for debugging"""
+    try:
+        session = await ensure_http_session()
+        async with state.lock:
+            ids = list(state.printers.keys())
+
+        results = {}
+        for pid in ids:
+            url = HTTP_STATUS_URL_TEMPLATE.format(printer_id=pid)
+            try:
+                req_timeout = aiohttp.ClientTimeout(total=5, connect=3)
+                async with session.get(url, timeout=req_timeout) as resp:
+                    if resp.status != 200:
+                        results[pid] = {"error": f"HTTP {resp.status}"}
+                        continue
+                    data = await resp.json()
+                    if not isinstance(data, dict):
+                        results[pid] = {"error": "Invalid response format"}
+                        continue
+                    status = data.get("status")
+                    if not isinstance(status, dict):
+                        results[pid] = {"error": "No status in response"}
+                        continue
+
+                    ts = data.get("received_at")
+                    parsed_ts = parse_iso8601(ts) if isinstance(ts, str) else None
+                    if parsed_ts is None:
+                        parsed_ts = now_utc()
+
+                    p = state.printers.get(pid)
+                    if p is None:
+                        results[pid] = {"error": "Printer not found in state"}
+                        continue
+
+                    async with p.lock:
+                        p.latest_status = status
+                        p.latest_status_ts = parsed_ts
+
+                    results[pid] = {
+                        "success": True,
+                        "status_fields": len(status),
+                        "timestamp": parsed_ts.isoformat(),
+                        "sample_data": {
+                            "mc_percent": status.get("mc_percent"),
+                            "gcode_state": status.get("gcode_state"),
+                            "nozzle_temper": status.get("nozzle_temper"),
+                        },
+                    }
+            except Exception as e:
+                results[pid] = {"error": str(e)}
+
+        return JSONResponse(results)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 @router.get("/printers")
 async def list_printers():
     async with state.lock:
@@ -1902,6 +2020,12 @@ async def on_startup():
         WS_URL,
         PHOTO_INTERVAL_SECONDS,
         IMAGE_TIMEOUT_SECONDS,
+    )
+    logger.info(
+        "HTTP Status Seeding: ENABLED=%s | URL_TEMPLATE=%s | INTERVAL=%s",
+        HTTP_STATUS_SEED_ON_STARTUP,
+        HTTP_STATUS_URL_TEMPLATE,
+        HTTP_STATUS_SEED_INTERVAL_SECONDS,
     )
     global _ws_task, _photo_task, _http_seed_task
     # In dynamic mode, we start a discovery loop that will spawn per-printer WS tasks.
