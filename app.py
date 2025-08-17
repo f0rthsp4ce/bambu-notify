@@ -198,7 +198,7 @@ class AppState:
 
 state = AppState()
 
-app = FastAPI(title="Printer Realtime Bridge", version="1.5.0")
+app = FastAPI(title="Printer Realtime Bridge", version="1.4.0")
 router = APIRouter(prefix="/api")
 
 
@@ -2319,13 +2319,12 @@ _photo_task: Optional[asyncio.Task] = None
 _http_seed_task: Optional[asyncio.Task] = None
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Application lifespan context."""
-    global _ws_task, _photo_task, _http_seed_task
+@app.on_event("startup")
+async def on_startup():
     logger.info(
-        "Starting app. PRINTER_ID=%s | PHOTO_INTERVAL_SECONDS=%s | IMAGE_TIMEOUT_SECONDS=%s",
+        "Starting app. PRINTER_ID=%s | WS_URL=%s | PHOTO_INTERVAL_SECONDS=%s | IMAGE_TIMEOUT_SECONDS=%s",
         PRINTER_ID,
+        WS_URL,
         PHOTO_INTERVAL_SECONDS,
         IMAGE_TIMEOUT_SECONDS,
     )
@@ -2335,12 +2334,11 @@ async def lifespan(app: FastAPI):
         HTTP_STATUS_URL_TEMPLATE,
         HTTP_STATUS_SEED_INTERVAL_SECONDS,
     )
-
+    global _ws_task, _photo_task, _http_seed_task
     # In dynamic mode, we start a discovery loop that will spawn per-printer WS tasks.
     _ws_task = asyncio.create_task(printers_discovery_loop())
     _photo_task = asyncio.create_task(photo_loop())
     _http_seed_task = asyncio.create_task(http_status_seed_loop())
-
     if ai_is_enabled():
         # Warm up AI client early to pay the init cost upfront
         try:
@@ -2353,11 +2351,12 @@ async def lifespan(app: FastAPI):
         except Exception:
             logger.warning("AI client initialization skipped or failed.")
 
-    yield
 
+@app.on_event("shutdown")
+async def on_shutdown():
     logger.info("Shutting down...")
     state.run_event.clear()
-
+    global _ws_task, _photo_task, _http_seed_task
     for task in (_ws_task, _photo_task, _http_seed_task):
         if task and not task.done():
             task.cancel()
@@ -2365,16 +2364,13 @@ async def lifespan(app: FastAPI):
                 await task
             except asyncio.CancelledError:
                 pass
-
     _ws_task = None
     _photo_task = None
     _http_seed_task = None
-
     # Cancel per-printer WS tasks
     async with state.lock:
         tasks = list(state.ws_tasks.values())
         state.ws_tasks.clear()
-
     for t in tasks:
         if t and not t.done():
             t.cancel()
@@ -2382,9 +2378,9 @@ async def lifespan(app: FastAPI):
                 await t
             except asyncio.CancelledError:
                 pass
-
     if state.http_session and not state.http_session.closed:
         await state.http_session.close()
+    # No explicit close needed for AsyncOpenAI
 
 
 # -----------------------------------------------------------------------------
