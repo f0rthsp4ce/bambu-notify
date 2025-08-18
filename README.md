@@ -210,6 +210,34 @@ Exported metrics include:
   - `bambu_status_bool{printer_id,path,index}`: boolean fields as 0/1
   - `bambu_status_string_info{printer_id,path,index,value}`: string fields as info
 
+### Grafana Dashboard
+
+- file: `dashboard.json` (repo root)
+- title: "Bambu Printer Monitoring Dashboard"
+- datasource: Prometheus
+
+#### Import steps
+1. In Grafana, go to Dashboards → New → Import.
+2. Upload `dashboard.json` (or paste its contents).
+3. When prompted, select your Prometheus data source.
+4. If you see data source errors after import:
+   - The JSON references a Prometheus data source with UID `prometheus`.
+   - Either set your Prometheus data source UID to `prometheus`, or replace `"uid": "prometheus"` in `dashboard.json` with your data source UID and re-import.
+
+#### What it includes
+- Overview: Online status pie and a table with Online/Active per `printer_id`.
+- Progress: Timeseries of `bambu_progress_percent` and a current progress gauge.
+- Temperatures: Nozzle (current/target), bed (current/target), chamber.
+- Stats: Nozzle/bed/chamber quick stats, Wi‑Fi signal (dBm), layer progress, remaining time.
+- Speeds: Print speed %, cooling fan %, heatbreak fan RPM.
+- Errors: Current `bambu_print_error_code`.
+- System: Process memory, file descriptors, CPU usage rate, Python GC metrics.
+
+#### Usage notes
+- Use the `Printer` variable to filter by `printer_id` (supports multi-select and All).
+- Default time range is last 1h; adjust in the Grafana time picker as needed.
+- Ensure Prometheus is scraping `/metrics` and Grafana points to that Prometheus instance.
+
 ## License
 
 MIT
