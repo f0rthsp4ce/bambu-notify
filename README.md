@@ -2,7 +2,7 @@
 
 **Smart monitoring and notifications for your Bambu 3D printers**
 
-Never miss a print failure again! Bambu Notify is a comprehensive monitoring solution that watches your Bambu 3D printers and keeps you informed about everything happening with your prints - whether you're at home or away.
+Never miss a print failure again! Bambu Notify is a comprehensive monitoring solution that works with [BambUI](https://github.com/fidoriel/BambUI) to watch your Bambu 3D printers and keep you informed about everything happening with your prints - whether you're at home or away.
 
 ## 🎯 What it does
 
@@ -51,9 +51,50 @@ Never miss a print failure again! Bambu Notify is a comprehensive monitoring sol
 
 ### Prerequisites
 
-1. **Bambu printer** with network connectivity
-2. **Telegram account** for notifications
-3. **Python 3.8+** or **Docker**
+1. **BambUI** - Required backend service that connects to your printers
+2. **Bambu printer** with network connectivity (P1S, P1P, A1, A1M)
+3. **Telegram account** for notifications
+4. **Python 3.8+** or **Docker**
+
+### 0. Set up BambUI (Required)
+
+**Bambu Notify requires [BambUI](https://github.com/fidoriel/BambUI) as its backend service.** BambUI handles the direct connection to your Bambu printers and provides the API/WebSocket endpoints that Bambu Notify connects to.
+
+**Install BambUI first:**
+
+```bash
+# Using Docker Compose (recommended)
+# Create bambui.yml file:
+cat > bambui.yml << EOF
+services:
+  bambui:
+    image: ghcr.io/fidoriel/bambui:edge
+    restart: always
+    ports:
+      - 8080:8080
+    environment:
+      - BAMBUI_PRINTER.MY-P1S.IP=192.168.1.100  # Your printer IP
+      - BAMBUI_PRINTER.MY-P1S.ACCESS_CODE=12345678  # Your access code
+      - BAMBUI_PRINTER.MY-P1S.SERIAL=01P00C12345678  # Your printer serial
+      - BAMBUI_PRINTER.MY-P1S.MODEL=P1S  # P1S, P1P, A1, or A1M
+EOF
+
+# Start BambUI
+docker compose -f bambui.yml up -d
+```
+
+**Verify BambUI is working:**
+- Open http://localhost:8080 in your browser
+- You should see your printer dashboard
+- API should be available at http://localhost:8080/api/printers
+
+**Configure Bambu Notify to use BambUI:**
+```bash
+export PRINTERS_API_URL="http://localhost:8080/api/printers"
+export WS_URL_TEMPLATE="ws://localhost:8080/ws/printer/{printer_id}"
+```
+
+For more details on BambUI setup, see the [BambUI documentation](https://github.com/fidoriel/BambUI).
 
 ### 1. Set up Telegram Bot
 
@@ -80,10 +121,14 @@ docker run -d --name bambu-notify \
   -e TELEGRAM_BOT_TOKEN="YOUR_BOT_TOKEN" \
   -e TELEGRAM_CHAT_ID="YOUR_CHAT_ID" \
   -e PRINTER_ID="YOUR_PRINTER_ID" \
+  -e PRINTERS_API_URL="http://localhost:8080/api/printers" \
+  -e WS_URL_TEMPLATE="ws://localhost:8080/ws/printer/{printer_id}" \
   -v $(pwd)/images:/app/images \
   --restart unless-stopped \
   bambu-notify:latest
 ```
+
+*Note: Adjust the BambUI URLs if your BambUI instance runs on a different host/port.*
 
 #### Option B: Python Installation
 
@@ -100,6 +145,8 @@ pip install -r requirements.txt
 export TELEGRAM_BOT_TOKEN="YOUR_BOT_TOKEN"
 export TELEGRAM_CHAT_ID="YOUR_CHAT_ID"
 export PRINTER_ID="YOUR_PRINTER_ID"
+export PRINTERS_API_URL="http://localhost:8080/api/printers"
+export WS_URL_TEMPLATE="ws://localhost:8080/ws/printer/{printer_id}"
 
 # Run the application
 python app.py
@@ -121,6 +168,8 @@ These are the minimum settings needed to get started:
 |----------|----------|-------------|---------|
 | `TELEGRAM_BOT_TOKEN` | **Yes** | Your Telegram bot token from @BotFather | `123456789:ABCDEF...` |
 | `TELEGRAM_CHAT_ID` | **Yes** | Chat ID where notifications will be sent | `-1001234567890` |
+| `PRINTERS_API_URL` | **Yes** | BambUI API endpoint for printer discovery | `http://localhost:8080/api/printers` |
+| `WS_URL_TEMPLATE` | **Yes** | BambUI WebSocket URL template | `ws://localhost:8080/ws/printer/{printer_id}` |
 | `PRINTER_ID` | No | Your printer ID (auto-discovered if not set) | `A1M-1` |
 
 ### Notification Settings
@@ -165,6 +214,8 @@ For fine-tuning and multi-printer setups:
 # Essential settings
 export TELEGRAM_BOT_TOKEN="123456789:ABCDEF..."
 export TELEGRAM_CHAT_ID="-1001234567890"
+export PRINTERS_API_URL="http://localhost:8080/api/printers"
+export WS_URL_TEMPLATE="ws://localhost:8080/ws/printer/{printer_id}"
 
 # Optional: Enable AI failure detection
 export OPENROUTER_API_KEY="sk-or-..."
@@ -332,10 +383,12 @@ Enable intelligent print monitoring with AI-powered defect detection:
 4. Look at the application logs for error messages
 
 **Printer not detected:**
-1. Verify your `PRINTER_ID` matches your actual printer ID
-2. Check if your printer is on the same network
-3. Ensure the printer discovery API is accessible
-4. Try the debug endpoint: `/api/debug/state`
+1. **Check BambUI first:** Ensure BambUI is running and accessible at your configured URL
+2. Verify BambUI can see your printer: Visit http://localhost:8080 
+3. Test the BambUI API directly: `curl http://localhost:8080/api/printers`
+4. Verify your `PRINTERS_API_URL` and `WS_URL_TEMPLATE` settings
+5. Check if your printer is on the same network as BambUI
+6. Try the debug endpoint: `/api/debug/state`
 
 **Timelapse not created:**
 1. Make sure `ffmpeg` is installed and accessible
