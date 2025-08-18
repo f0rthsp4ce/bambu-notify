@@ -3,13 +3,10 @@ import asyncio
 import base64
 import json
 import logging
-import math
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any, Set, List, Tuple
 from pathlib import Path
 import shutil
-import tempfile
-from contextlib import asynccontextmanager
 
 import aiohttp
 
@@ -757,16 +754,12 @@ def _collect_job_images(
     return files_sorted
 
 
-async def _run_ffmpeg_build(
+async def _run_ffmpeg_build_timelapse(
     frames_dir: Path,
-    frame_fps: int,
-    max_width: int,
-    crf: int,
     out_path: Path,
-    target_bitrate_kbps: Optional[int] = None,
+    speedup_factor: int = 30,
 ) -> bool:
-    vf_parts = [f"scale='if(gt(iw,{max_width}),{max_width},iw)':-2", "format=yuv420p"]
-    vf = ",".join(vf_parts)
+    """Build timelapse using glob pattern and frame selection for speedup."""
     cmd: List[str] = [
         "ffmpeg",
         "-y",
@@ -774,27 +767,21 @@ async def _run_ffmpeg_build(
         "-loglevel",
         "error",
         "-framerate",
-        str(frame_fps),
+        "30",
+        "-pattern_type",
+        "glob",
         "-i",
-        str(frames_dir / "%06d.jpg"),
+        str(frames_dir / "*.jpg"),
         "-vf",
-        vf,
+        f"select='not(mod(n,{speedup_factor}))',setpts=N/30/TB",
         "-c:v",
         "libx264",
-        "-preset",
-        "veryfast",
         "-pix_fmt",
         "yuv420p",
-        "-movflags",
-        "+faststart",
-        "-crf",
-        str(crf),
+        "-r",
+        "30",
+        str(out_path),
     ]
-    if target_bitrate_kbps is not None:
-        # Apply a capped bitrate to enforce smaller sizes
-        kbps = max(200, target_bitrate_kbps)
-        cmd += ["-b:v", f"{kbps}k", "-maxrate", f"{kbps}k", "-bufsize", f"{kbps * 2}k"]
-    cmd.append(str(out_path))
 
     try:
         proc = await asyncio.create_subprocess_exec(*cmd)
@@ -820,69 +807,36 @@ async def build_timelapse(
         )
         return None
 
-    # Compute fps to target desired duration
-    frames_count = len(images)
-    target_duration = max(5, TIMELAPSE_TARGET_DURATION_SECONDS)
-    fps_float = min(TIMELAPSE_FPS_CAP, max(1.0, frames_count / float(target_duration)))
-    fps = int(math.ceil(fps_float))
-
     job_dir = ensure_images_dir(job_name, pstate)
-    out_name = f"timelapse_{now_utc().strftime('%Y%m%dT%H%M%S')}.mp4"
+    out_name = f"timelapse_30x_{now_utc().strftime('%Y%m%dT%H%M%S')}.mp4"
     out_path = job_dir / out_name
 
-    # Prepare temp directory with sequential links
-    with tempfile.TemporaryDirectory(prefix="frames_") as tmp:
-        tmp_dir = Path(tmp)
-        for idx, src in enumerate(images, start=1):
-            dst = tmp_dir / f"{idx:06d}.jpg"
-            try:
-                os.symlink(src.resolve(), dst)
-            except Exception:
-                try:
-                    os.link(src.resolve(), dst)
-                except Exception:
-                    shutil.copy2(src, dst)
+    # Build timelapse with 30x speedup directly from the job directory
+    ok = await _run_ffmpeg_build_timelapse(job_dir, out_path, speedup_factor=30)
 
-        attempts: List[Tuple[int, int, Optional[int]]] = [
-            # (max_width, crf, bitrate_kbps)
-            (TIMELAPSE_MAX_WIDTH, 28, None),
-            (min(TIMELAPSE_MAX_WIDTH, 960), 30, None),
-            (min(TIMELAPSE_MAX_WIDTH, 720), 32, None),
-        ]
-        # Final attempt: enforce bitrate to fit within limit
-        # bitrate (kbps) ~= (MAX_BYTES * 8) / duration / 1000 (with 10% safety)
-        est_duration = max(1.0, frames_count / float(fps))
-        target_kbps = int(((TIMELAPSE_MAX_BYTES * 8.0) / est_duration) / 1000.0 * 0.9)
-        attempts.append((min(TIMELAPSE_MAX_WIDTH, 640), 34, max(200, target_kbps)))
+    if not ok:
+        logger.warning("Failed to create timelapse for job %s", job_name)
+        return None
 
-        for max_w, crf, kbps in attempts:
-            tmp_out = out_path.with_suffix("")
-            tmp_out = (
-                tmp_out.parent
-                / f".{tmp_out.name}_{max_w}_{crf}{'_br' if kbps else ''}.mp4"
+    # Check if file was created and is within size limit
+    try:
+        size = out_path.stat().st_size
+        if size > TIMELAPSE_MAX_BYTES:
+            logger.warning(
+                "Timelapse for job %s is too large (%d bytes > %d limit), but keeping it",
+                job_name,
+                size,
+                TIMELAPSE_MAX_BYTES,
             )
-            ok = await _run_ffmpeg_build(tmp_dir, fps, max_w, crf, tmp_out, kbps)
-            if not ok:
-                continue
-            try:
-                size = tmp_out.stat().st_size
-            except Exception:
-                size = 0
-            if 0 < size <= TIMELAPSE_MAX_BYTES:
-                # Move into place
-                try:
-                    os.replace(tmp_out, out_path)
-                except Exception:
-                    shutil.copy2(tmp_out, out_path)
-                return out_path
-            else:
-                try:
-                    tmp_out.unlink(missing_ok=True)
-                except Exception:
-                    pass
-
-    logger.warning("Failed to produce timelapse under size limit for job %s", job_name)
-    return None
+        logger.info(
+            "Created timelapse for job %s: %s (%d bytes)", job_name, out_path.name, size
+        )
+        return out_path
+    except Exception as e:
+        logger.warning(
+            "Failed to check timelapse file size for job %s: %s", job_name, e
+        )
+        return out_path if out_path.exists() else None
 
 
 async def build_and_send_timelapse_if_available(
