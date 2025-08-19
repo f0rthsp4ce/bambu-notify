@@ -7,8 +7,10 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any, Set, List, Tuple
 from pathlib import Path
 import shutil
+import io
 
 import aiohttp
+from PIL import Image
 
 try:
     # Prefer async client to avoid blocking the event loop
@@ -574,6 +576,82 @@ def build_image_filename(job_name: Optional[str], ts: datetime, seq: int) -> str
     return f"{ts.strftime('%Y%m%dT%H%M%S')}_{seq:06d}_{safe_job}.jpg"
 
 
+def embed_print_metadata(image_bytes: bytes, status: Optional[Dict[str, Any]]) -> bytes:
+    """Embed print metadata into JPEG EXIF data.
+
+    Args:
+        image_bytes: Original JPEG image bytes
+        status: Current printer status containing print information
+
+    Returns:
+        Modified JPEG bytes with embedded metadata
+    """
+    if not status:
+        return image_bytes
+
+    try:
+        # Open image from bytes
+        img = Image.open(io.BytesIO(image_bytes))
+
+        # Extract metadata from status
+        print_name = safe_get(status, "subtask_name") or "Unknown"
+        progress = safe_get(status, "mc_percent")
+        current_layer = safe_get(status, "layer_num")
+        total_layers = safe_get(status, "total_layer_num")
+        gcode_state = safe_get(status, "gcode_state") or "Unknown"
+        remaining_time = safe_get(status, "mc_remaining_time")
+
+        # Create metadata strings
+        progress_str = f"{progress}%" if progress is not None else "Unknown"
+        layer_str = (
+            f"{current_layer}/{total_layers}"
+            if current_layer is not None and total_layers is not None
+            else f"{current_layer}"
+            if current_layer is not None
+            else "Unknown"
+        )
+
+        # Build comprehensive description
+        description_parts = [
+            f"Print: {print_name}",
+            f"Progress: {progress_str}",
+            f"Layer: {layer_str}",
+            f"State: {gcode_state}",
+        ]
+
+        if remaining_time is not None:
+            eta_str = format_time_remaining(remaining_time)
+            description_parts.append(f"ETA: {eta_str}")
+
+        description = " | ".join(description_parts)
+
+        # Get existing EXIF data or create new
+        exif_dict = img.getexif()
+
+        # Add custom metadata to EXIF
+        # Use standard EXIF tags where possible
+        exif_dict[0x010E] = description  # ImageDescription
+        exif_dict[0x010F] = "Bambu Notify"  # Make
+        exif_dict[0x0110] = "3D Printer Monitor"  # Model
+        exif_dict[0x0131] = "Bambu Notify v1.4.0"  # Software
+        exif_dict[0x9003] = datetime.now().strftime(
+            "%Y:%m:%d %H:%M:%S"
+        )  # DateTimeOriginal
+
+        # Add custom tags for specific print data
+        exif_dict[0x9286] = f"PrintName: {print_name}"  # UserComment (print name)
+
+        # Save image with new EXIF data
+        output = io.BytesIO()
+        img.save(output, format="JPEG", exif=exif_dict, quality=95)
+        return output.getvalue()
+
+    except Exception as e:
+        logger.warning("Failed to embed metadata in image: %s", e)
+        # Return original image if metadata embedding fails
+        return image_bytes
+
+
 async def save_image_if_active_job(pstate: PrinterState, image_bytes: bytes) -> None:
     if not image_bytes:
         return
@@ -587,12 +665,25 @@ async def save_image_if_active_job(pstate: PrinterState, image_bytes: bytes) -> 
     target_dir = ensure_images_dir(job or None, pstate)
     fname = build_image_filename(job, ts, seq)
     try:
+        # Embed print metadata into the image
+        enhanced_image_bytes = embed_print_metadata(image_bytes, status)
+
         # Write atomically
         tmp_path = target_dir / (fname + ".tmp")
         final_path = target_dir / fname
         with open(tmp_path, "wb") as f:
-            f.write(image_bytes)
+            f.write(enhanced_image_bytes)
         os.replace(tmp_path, final_path)
+
+        # Log successful metadata embedding
+        if enhanced_image_bytes != image_bytes:
+            logger.info(
+                "Saved image %s with embedded metadata (print: %s, progress: %s%%, layer: %s)",
+                fname,
+                safe_get(status, "subtask_name"),
+                safe_get(status, "mc_percent"),
+                safe_get(status, "layer_num"),
+            )
     except Exception as e:
         logger.warning("Failed to save image %s: %s", fname, e)
 
