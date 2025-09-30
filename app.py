@@ -2174,7 +2174,7 @@ async def maybe_notify_on_update(
 
     pstate.prev_status = new_status.copy()
 
-def state_change_requires_notification(prev_state: Optional[str], new_state: str):
+def state_change_requires_notification(prev_state: Optional[str], new_state: str) -> bool:
     return not (prev_state in IGNORE_TRANSITIONS and new_state in IGNORE_TRANSITIONS)
 
 # -----------------------------------------------------------------------------
