@@ -111,6 +111,12 @@ FINISHED_STATES = {
     "FAILED",
 }
 
+IGNORE_TRANSITIONS = {
+    "FINISH",
+    "FINISHED",
+    "IDLE",
+}
+
 # -----------------------------------------------------------------------------
 # Logging
 # -----------------------------------------------------------------------------
@@ -2107,28 +2113,30 @@ async def maybe_notify_on_update(
 
     # State change
     if new_state and new_state != pstate.last_notified_state:
-        await telegram_send(
-            f"🔄 [{pstate.printer_id}] State changed: {old_state or 'unknown'} → {new_state}\n{summarize_status_for_notification(new_status)}"
-        )
+        prev_state = pstate.last_notified_state
         pstate.last_notified_state = new_state
-
-        # If job just finished/idle, summary + final photo + timelapse
-        if is_finished_state(new_state):
+        if state_change_requires_notification(prev_state, new_state):
             await telegram_send(
-                f"✅ [{pstate.printer_id}] Print completed.\n{summarize_status_for_notification(new_status)}"
+                f"🔄 [{pstate.printer_id}] State changed: {old_state or 'unknown'} → {new_state}\n{summarize_status_for_notification(new_status)}"
             )
-            img = pstate.latest_image_bytes
-            if img:
-                caption = f"🏁 Final photo\n{summarize_status_for_notification(new_status)}\nTime: {now_utc().isoformat()}"
-                await telegram_send_photo(img, caption)
-            pstate.last_photo_sent_at = None
-            # Spawn timelapse build in background to avoid blocking
-            try:
-                asyncio.create_task(
-                    build_and_send_timelapse_if_available(pstate, new_status)
+
+            # If job just finished/idle, summary + final photo + timelapse
+            if is_finished_state(new_state):
+                await telegram_send(
+                    f"✅ [{pstate.printer_id}] Print completed.\n{summarize_status_for_notification(new_status)}"
                 )
-            except Exception:
-                logger.debug("Failed to schedule timelapse task")
+                img = pstate.latest_image_bytes
+                if img:
+                    caption = f"🏁 Final photo\n{summarize_status_for_notification(new_status)}\nTime: {now_utc().isoformat()}"
+                    await telegram_send_photo(img, caption)
+                pstate.last_photo_sent_at = None
+                # Spawn timelapse build in background to avoid blocking
+                try:
+                    asyncio.create_task(
+                        build_and_send_timelapse_if_available(pstate, new_status)
+                    )
+                except Exception:
+                    logger.debug("Failed to schedule timelapse task")
 
     # Error
     try:
@@ -2166,6 +2174,8 @@ async def maybe_notify_on_update(
 
     pstate.prev_status = new_status.copy()
 
+def state_change_requires_notification(prev_state: Optional[str], new_state: str) -> bool:
+    return not (prev_state in IGNORE_TRANSITIONS and new_state in IGNORE_TRANSITIONS)
 
 # -----------------------------------------------------------------------------
 # Background hourly photo loop
